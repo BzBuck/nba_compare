@@ -39,11 +39,17 @@ def _compute_usage(games_with_team: pd.DataFrame) -> dict | None:
     if player_min and team_usage_events:
         usg_pct = 100 * (player_usage_events * (team_min / 5)) / (player_min * team_usage_events)
 
+    # MIN% -- share of the team's total floor time this player occupied.
+    # Same shape of calc as USG% but simpler: no possession-event estimate,
+    # just player minutes over (team minutes / 5), aggregated across the span.
+    min_pct = 100 * player_min / (team_min / 5) if team_min else None
+
     n = len(valid)
     return {
         "usg_pct": usg_pct,
         "usage_per_game": player_usage_events / n if n else None,  # raw plays used (FGA+.44FTA+TOV), PER GAME
         "total_usage": player_usage_events,  # full-span total, kept for reference/custom formulas
+        "min_pct": min_pct,
         "games_with_team_data": n,
         "games_missing_team_data": len(games_with_team) - n,
     }
@@ -60,6 +66,11 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
     ORtg = 100 * team points / team possessions
     DRtg = 100 * opponent points / opponent possessions (points allowed per
            100 opponent possessions -- lower is better defense)
+
+    Pace uses the standard NBA formula (both sides' possessions, normalized
+    to a 48-minute game via team minutes played -- this is why it needed
+    TEAM_MIN, which wasn't wired into anything until now):
+      Pace = 48 * ((team_poss + opp_poss) / (2 * (team_MIN / 5)))
     """
     valid = games_with_team.dropna(subset=["TEAM_PTS", "TEAM_FGA", "TEAM_OREB", "TEAM_FTA", "TEAM_TOV"])
     if valid.empty:
@@ -74,6 +85,7 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
         "team_ortg": 100 * team_pts / team_poss if team_poss else None,
         "team_drtg": None,
         "team_net_rtg": None,
+        "team_pace": None,
     }
 
     valid_opp = games_with_team.dropna(subset=["OPP_PTS", "OPP_FGA", "OPP_OREB", "OPP_FTA", "OPP_TOV"])
@@ -84,6 +96,18 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
 
     if result["team_ortg"] is not None and result["team_drtg"] is not None:
         result["team_net_rtg"] = result["team_ortg"] - result["team_drtg"]
+
+    pace_cols = ["TEAM_MIN", "TEAM_FGA", "TEAM_OREB", "TEAM_FTA", "TEAM_TOV",
+                 "OPP_FGA", "OPP_OREB", "OPP_FTA", "OPP_TOV"]
+    valid_pace = games_with_team.dropna(subset=pace_cols)
+    if not valid_pace.empty:
+        team_poss_p = (valid_pace["TEAM_FGA"] - valid_pace["TEAM_OREB"] + valid_pace["TEAM_TOV"]
+                       + 0.44 * valid_pace["TEAM_FTA"]).sum()
+        opp_poss_p = (valid_pace["OPP_FGA"] - valid_pace["OPP_OREB"] + valid_pace["OPP_TOV"]
+                      + 0.44 * valid_pace["OPP_FTA"]).sum()
+        team_min_p = valid_pace["TEAM_MIN"].sum()
+        if team_min_p:
+            result["team_pace"] = 48 * ((team_poss_p + opp_poss_p) / (2 * (team_min_p / 5)))
 
     return result
 
@@ -129,7 +153,8 @@ def _compute_consistency(games: pd.DataFrame) -> dict:
     usage_game = tsa_game + games["TOV"]
     ts_pct_game = (games["PTS"] / (2 * tsa_game)).replace([float("inf"), float("-inf")], None)
 
-    for key, vals in [("TSA", tsa_game), ("USG_EVENTS", usage_game), ("TS_PCT", ts_pct_game)]:
+    for key, vals in [("TSA", tsa_game), ("USG_EVENTS", usage_game), ("TS_PCT", ts_pct_game),
+                       ("MIN", games["MIN_NUM"])]:
         result[key] = _stat_with_floor(vals)
 
     return result
@@ -142,6 +167,7 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
 
     gp = len(games)
     minutes = games["MIN_NUM"].sum()
+    minutes_per_game = minutes / gp
     totals = {c: games[c].sum() for c in COUNTING_STATS}
 
     per_game = {c: totals[c] / gp for c in COUNTING_STATS}
@@ -177,6 +203,7 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
     return {
         "games": gp,
         "minutes_total": minutes,
+        "minutes_per_game": minutes_per_game,
         "wins": wins,
         "losses": losses,
         "totals": totals,

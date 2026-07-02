@@ -95,20 +95,22 @@ Everything below lives in `table.STAT_DEFS`, one dict entry per row, so
 adding/renaming a stat is a one-line change in `table.py`. All are
 toggleable/reorderable in the app; the ★ ones are on by default.
 
-**Box score** — ★GP, ★W, ★L, ★PTS/G, ★TRB/G, ★AST/G, ★STL/G, ★BLK/G,
-★TOV/G, ★PF/G, ★+/-
+**Box score** — ★GP, ★W, ★L, ★MIN/G, ★PTS/G, ★TRB/G, ★AST/G, ★STL/G,
+★BLK/G, ★TOV/G, ★PF/G, ★+/-
 
 **Shooting** — ★FG%, ★3P%, ★FT%, ★eFG%, ★TS%, ★TSA/G (true shot attempts =
 FGA + .44·FTA, i.e. usage without the turnovers)
 
-**Usage** — ★USG%, ★USG Vol/G (raw plays used per game, not a %)
+**Usage** — ★USG%, ★USG Vol/G (raw plays used per game, not a %), MIN%
+(share of the team's total floor time this player occupied)
 
-**Team context** — Team PTS/G, Team Poss/G, Team ORtg, Team DRtg, Net Rtg
-(ORtg − DRtg), Team W%
+**Team context** — Team PTS/G, Team Poss/G, Team Pace (real two-team pace
+formula, not a single-team estimate — see below), Team ORtg, Team DRtg,
+Net Rtg (ORtg − DRtg), Team W%
 
-**Consistency** — PTS/TRB/AST/STL/BLK/TOV/3PM/FGM/FTM/TSA/Usage Vol/TS%
-CV% (coefficient of variation — see below), plus PTS/TRB/AST/STL/BLK/TS%
-Floor (P10)
+**Consistency** — MIN/PTS/TRB/AST/STL/BLK/TOV/3PM/FGM/FTM/TSA/Usage
+Vol/TS% CV% (coefficient of variation — see below), plus
+MIN/PTS/TRB/AST/STL/BLK/TS% Floor (P10)
 
 **Other** — +/- Std Dev
 
@@ -131,14 +133,18 @@ game (early exit, garbage-time line) shouldn't define "what to expect on
 a bad night" — the floor means "about 1 game in 10 is this bad or worse,"
 which is a more realistic idea of a bad-night baseline.
 
-### Team ORtg / DRtg — what's real here, and what isn't
+### Team ORtg / DRtg / Pace — what's real here, and what isn't
 
-**Team-level** ORtg/DRtg are computed properly: ORtg = 100 × team points ÷
-team possessions; DRtg = 100 × opponent points ÷ opponent possessions
-(needs the actual opposing team's box score for that game, joined by
-`GAME_ID`). Possessions use the standard single-team estimate (FGA − OREB
-+ TOV + .44·FTA) applied to each side separately — not a full two-team
-pace formula, but the right idea for each side.
+**Team-level** ORtg/DRtg/Pace are computed properly. ORtg = 100 × team
+points ÷ team possessions; DRtg = 100 × opponent points ÷ opponent
+possessions (needs the actual opposing team's box score for that game,
+joined by `GAME_ID`). Possessions use the standard single-team estimate
+(FGA − OREB + TOV + .44·FTA) applied to each side separately. Pace uses
+the standard NBA formula — both sides' possessions, normalized to a
+48-minute game via the team's actual minutes played (accounting for
+overtime): `48 × ((team_poss + opp_poss) / (2 × (team_MIN / 5)))`. This
+needed team minutes, which wasn't wired into anything until it got added
+alongside player MIN/G.
 
 **Individual (player-level) ORtg/DRtg are NOT implemented.** The real
 Dean Oliver formula chains together roughly 15 intermediate terms (a
@@ -164,11 +170,12 @@ Available variables (also shown in the app's "Available variable names"
 sidebar expander): counting stats per game (`PTS`, `REB`, `OREB`, `DREB`,
 `AST`, `STL`, `BLK`, `TOV`, `PF`, `FGM`, `FGA`, `FG3M`, `FG3A`, `FTM`,
 `FTA`), shooting (`FG_PCT`, `FG3_PCT`, `FT_PCT`, `EFG_PCT`, `TS_PCT`,
-`TSA_G`), plus-minus (`PLUS_MINUS`, `PLUS_MINUS_STD`), record (`W`, `L`,
-`GP`, `WIN_PCT`), usage (`USG_PCT`, `USG_VOL_G`), team context
-(`TEAM_PTS_G`, `TEAM_POSS_G`, `TEAM_ORTG`, `TEAM_DRTG`, `TEAM_NET_RTG`),
-consistency (`*_CV` and `*_FLOOR` for every stat that has one, e.g.
-`PTS_CV`, `PTS_FLOOR`, `TS_PCT_CV`).
+`TSA_G`), minutes (`MIN_G`, `MIN_PCT`), plus-minus (`PLUS_MINUS`,
+`PLUS_MINUS_STD`), record (`W`, `L`, `GP`, `WIN_PCT`), usage (`USG_PCT`,
+`USG_VOL_G`), team context (`TEAM_PTS_G`, `TEAM_POSS_G`, `TEAM_PACE`,
+`TEAM_ORTG`, `TEAM_DRTG`, `TEAM_NET_RTG`), consistency (`*_CV` and
+`*_FLOOR` for every stat that has one, e.g. `PTS_CV`, `PTS_FLOOR`,
+`MIN_CV`, `TS_PCT_CV`).
 
 ## Save / Load
 

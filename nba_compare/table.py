@@ -17,6 +17,7 @@ STAT_DEFS = {
     "GP":         (lambda b: b["games"],                               "{:.0f}", False),
     "W":          (lambda b: b["wins"],                                "{:.0f}", False),
     "L":          (lambda b: b["losses"],                              "{:.0f}", True),
+    "MIN/G":      (lambda b: b["minutes_per_game"],                     "{:.1f}", False),
     "PTS/G":      (lambda b: b["per_game"]["PTS"],                      "{:.1f}", False),
     "TRB/G":      (lambda b: b["per_game"]["REB"],                      "{:.1f}", False),
     "AST/G":      (lambda b: b["per_game"]["AST"],                      "{:.1f}", False),
@@ -31,21 +32,25 @@ STAT_DEFS = {
     "eFG%":       (lambda b: b["shooting"]["EFG_PCT"],                  "{:.3f}", False),
     "TS%":        (lambda b: b["shooting"]["TS_PCT"],                   "{:.3f}", False),
     "TSA/G":      (lambda b: b["tsa_per_game"],                         "{:.1f}", False),
+    "MIN%":       (lambda b: (b["usage"] or {}).get("min_pct"),         "{:.1f}", False),
     "USG%":       (lambda b: (b["usage"] or {}).get("usg_pct"),         "{:.1f}", False),
     "USG Vol/G":  (lambda b: (b["usage"] or {}).get("usage_per_game"),  "{:.1f}", False),
     "Team PTS/G": (lambda b: (b["team"] or {}).get("team_pts_per_game"),   "{:.1f}", False),
     "Team Poss/G": (lambda b: (b["team"] or {}).get("team_poss_per_game"), "{:.1f}", False),
+    "Team Pace":  (lambda b: (b["team"] or {}).get("team_pace"),        "{:.1f}", False),
     "Team ORtg":  (lambda b: (b["team"] or {}).get("team_ortg"),        "{:.1f}", False),
     "Team DRtg":  (lambda b: (b["team"] or {}).get("team_drtg"),        "{:.1f}", True),
     "Net Rtg":    (lambda b: (b["team"] or {}).get("team_net_rtg"),     "{:+.1f}", False),
     "Team W%":    (lambda b: (b["wins"] / (b["wins"] + b["losses"]))
                              if b["wins"] is not None and (b["wins"] + b["losses"]) > 0 else None, "{:.3f}", False),
+    "MIN Floor (P10)": (lambda b: b["consistency"]["MIN"]["floor"],     "{:.1f}", False),
     "PTS Floor (P10)": (lambda b: b["consistency"]["PTS"]["floor"],     "{:.1f}", False),
     "TRB Floor (P10)": (lambda b: b["consistency"]["REB"]["floor"],     "{:.1f}", False),
     "AST Floor (P10)": (lambda b: b["consistency"]["AST"]["floor"],     "{:.1f}", False),
     "STL Floor (P10)": (lambda b: b["consistency"]["STL"]["floor"],     "{:.1f}", False),
     "BLK Floor (P10)": (lambda b: b["consistency"]["BLK"]["floor"],     "{:.1f}", False),
     "TS% Floor (P10)": (lambda b: b["consistency"]["TS_PCT"]["floor"],  "{:.3f}", False),
+    "MIN CV%":    (lambda b: b["consistency"]["MIN"]["cv_pct"],         "{:.1f}", True),
     "PTS CV%":    (lambda b: b["consistency"]["PTS"]["cv_pct"],         "{:.1f}", True),
     "TRB CV%":    (lambda b: b["consistency"]["REB"]["cv_pct"],         "{:.1f}", True),
     "AST CV%":    (lambda b: b["consistency"]["AST"]["cv_pct"],         "{:.1f}", True),
@@ -64,7 +69,7 @@ STAT_DEFS = {
 # answer a different question than raw production and would clutter the
 # default view.
 DEFAULT_STAT_LABELS = [
-    "GP", "W", "L", "PTS/G", "TRB/G", "AST/G", "STL/G", "BLK/G", "TOV/G", "PF/G", "+/-",
+    "GP", "W", "L", "MIN/G", "PTS/G", "TRB/G", "AST/G", "STL/G", "BLK/G", "TOV/G", "PF/G", "+/-",
     "FG%", "3P%", "FT%", "eFG%", "TS%", "USG%", "USG Vol/G",
 ]
 

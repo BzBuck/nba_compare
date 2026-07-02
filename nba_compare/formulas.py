@@ -85,6 +85,7 @@ def flatten_block_for_formula(block: dict | None) -> dict:
     variables.update(block.get("shooting", {}))        # FG_PCT, FG3_PCT, FT_PCT, EFG_PCT, TS_PCT
 
     variables["TSA_G"] = block.get("tsa_per_game")
+    variables["MIN_G"] = block.get("minutes_per_game")
     variables["PLUS_MINUS"] = block.get("plus_minus_per_game")
     variables["PLUS_MINUS_STD"] = block.get("plus_minus_std")
     variables["W"] = block.get("wins")
@@ -93,10 +94,12 @@ def flatten_block_for_formula(block: dict | None) -> dict:
     usage = block.get("usage") or {}
     variables["USG_PCT"] = usage.get("usg_pct")
     variables["USG_VOL_G"] = usage.get("usage_per_game")
+    variables["MIN_PCT"] = usage.get("min_pct")
 
     team = block.get("team") or {}
     variables["TEAM_PTS_G"] = team.get("team_pts_per_game")
     variables["TEAM_POSS_G"] = team.get("team_poss_per_game")
+    variables["TEAM_PACE"] = team.get("team_pace")
     variables["TEAM_ORTG"] = team.get("team_ortg")
     variables["TEAM_DRTG"] = team.get("team_drtg")
     variables["TEAM_NET_RTG"] = team.get("team_net_rtg")
@@ -116,11 +119,12 @@ def flatten_block_for_formula(block: dict | None) -> dict:
 AVAILABLE_VARIABLES = [
     "PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF",
     "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
-    "FG_PCT", "FG3_PCT", "FT_PCT", "EFG_PCT", "TS_PCT", "TSA_G",
+    "FG_PCT", "FG3_PCT", "FT_PCT", "EFG_PCT", "TS_PCT", "TSA_G", "MIN_G",
     "PLUS_MINUS", "PLUS_MINUS_STD", "W", "L", "GP", "WIN_PCT",
-    "USG_PCT", "USG_VOL_G", "TEAM_PTS_G", "TEAM_POSS_G", "TEAM_ORTG", "TEAM_DRTG", "TEAM_NET_RTG",
+    "USG_PCT", "USG_VOL_G", "MIN_PCT",
+    "TEAM_PTS_G", "TEAM_POSS_G", "TEAM_PACE", "TEAM_ORTG", "TEAM_DRTG", "TEAM_NET_RTG",
     "PTS_CV", "REB_CV", "AST_CV", "STL_CV", "BLK_CV", "TOV_CV", "FG3M_CV", "FGM_CV", "FTM_CV",
-    "TSA_CV", "USG_EVENTS_CV", "TS_PCT_CV",
+    "TSA_CV", "USG_EVENTS_CV", "TS_PCT_CV", "MIN_CV",
     "PTS_FLOOR", "REB_FLOOR", "AST_FLOOR", "STL_FLOOR", "BLK_FLOOR", "TOV_FLOOR",
-    "FG3M_FLOOR", "FGM_FLOOR", "FTM_FLOOR", "TSA_FLOOR", "USG_EVENTS_FLOOR", "TS_PCT_FLOOR",
+    "FG3M_FLOOR", "FGM_FLOOR", "FTM_FLOOR", "TSA_FLOOR", "USG_EVENTS_FLOOR", "TS_PCT_FLOOR", "MIN_FLOOR",
 ]
