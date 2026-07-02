@@ -1,0 +1,5 @@
+pandas
+pyarrow
+plotly
+streamlit
+streamlit-sortables
