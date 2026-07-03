@@ -6,6 +6,8 @@ from __future__ import annotations
 import pandas as pd
 from .data import NBADataStore, COUNTING_STATS
 from .models import PlayerSpan
+from . import playoffs as _playoffs
+from . import percentiles as _percentiles
 
 # Stats we compute per-game standard deviation / coefficient-of-variation for,
 # as a rough "consistency" read: how much a player's game-to-game output swings.
@@ -225,10 +227,18 @@ def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
         result["regular"] = _stat_block(
             store.games_with_team_context(span.player_id, span.seasons, "regular")
         )
+        if result["regular"] is not None:
+            result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
     if span.include_playoffs:
         result["playoffs"] = _stat_block(
             store.games_with_team_context(span.player_id, span.seasons, "playoffs")
         )
+        if result["playoffs"] is not None:
+            result["playoffs"]["percentiles"] = _percentiles.span_percentiles(store, span, "playoffs")
+            raw_playoff_games = store.games(span.player_id, span.seasons, "playoffs")
+            records = _playoffs.compute_series_records(store, raw_playoff_games)
+            result["playoffs"]["series_records"] = records
+            result["playoffs"]["depth"] = _playoffs.depth_summary(records)
     return result
 
 

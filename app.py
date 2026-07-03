@@ -20,6 +20,10 @@ from nba_compare.table import (
 )
 from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_formula, AVAILABLE_VARIABLES
 from nba_compare.session_config import serialize_config, deserialize_config, ConfigError
+from nba_compare.playoffs import (
+    render_series_table_html, build_series_table, SERIES_COLUMN_DEFS, DEFAULT_SERIES_COLUMNS,
+    round_labels_present, build_round_comparison_table,
+)
 
 st.set_page_config(page_title="NBA Compare", layout="wide")
 
@@ -49,6 +53,8 @@ if "custom_formulas" not in st.session_state:
     st.session_state.custom_formulas = []  # list of {"label": str, "expr": str}
 if "stat_order" not in st.session_state:
     st.session_state.stat_order = list(DEFAULT_STAT_LABELS)
+if "series_col_order" not in st.session_state:
+    st.session_state.series_col_order = list(DEFAULT_SERIES_COLUMNS)
 
 
 def add_span():
@@ -386,6 +392,96 @@ else:
                 "CV% = game-to-game standard deviation \u00f7 mean, as a percent. Lower means more "
                 "predictable output game to game; it isn't a judgment of good or bad for a given role."
             )
+        if any(lbl.endswith("%ile") for lbl in stat_labels):
+            st.caption(
+                "%ile = where this stat ranks among qualifying players **in that same season** "
+                "(min. 10 games regular season, 1 game playoffs) -- 90 means better than ~90% of the "
+                "league that year. A span covering multiple seasons shows a games-weighted average "
+                "across those seasons. Turnovers are inverted so higher %ile always means better, "
+                "same as every other stat here."
+            )
+
+    if has_playoffs:
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander("Playoff series breakdown", expanded=False):
+            st.caption(
+                "Series and rounds come from the TEAM's full game log (not just this player's games), "
+                "then this player's own games are matched into that structure -- so a round they missed "
+                "to injury still shows up correctly (marked **(DNP)**) instead of mis-numbering every "
+                "round after it or costing them championship credit. Championship detection uses that "
+                "season's actual deepest round league-wide (not a hardcoded round count), so it stays "
+                "correct across playoff formats with different numbers of rounds. "
+                "**Home Court** is exact -- it's just whoever hosted Game 1. "
+                "**Seed is an approximation** (regular-season win% rank within conference) -- it doesn't "
+                "apply real tiebreakers or account for play-in games, so treat it as a rough signal, not "
+                "an official seed."
+            )
+
+            series_available_labels = list(SERIES_COLUMN_DEFS.keys())
+            if "selected_series_cols" not in st.session_state:
+                st.session_state.selected_series_cols = [
+                    c for c in st.session_state.series_col_order if c in series_available_labels
+                ]
+            selected_series_cols = st.multiselect(
+                "Series columns to show (Season/Round/Opponent/Result are always shown)",
+                options=series_available_labels,
+                key="selected_series_cols",
+            )
+
+            ordered_series_cols = [c for c in st.session_state.series_col_order if c in selected_series_cols]
+            ordered_series_cols += [c for c in selected_series_cols if c not in ordered_series_cols]
+            st.session_state.series_col_order = ordered_series_cols
+
+            if ordered_series_cols:
+                st.caption("Drag to reorder:")
+                sorter_key = "series_col_sorter_" + "|".join(sorted(ordered_series_cols))
+                new_series_order = sort_items(ordered_series_cols, key=sorter_key)
+                if new_series_order and set(new_series_order) == set(ordered_series_cols):
+                    st.session_state.series_col_order = new_series_order
+                else:
+                    st.session_state.series_col_order = ordered_series_cols
+            series_cols = st.session_state.series_col_order
+
+            spans_records = {
+                agg["label"]: agg["playoffs"]["series_records"]
+                for agg in result.aggregates
+                if agg["playoffs"] is not None and "series_records" in agg["playoffs"]
+            }
+            rounds = round_labels_present(spans_records)
+            comparison_cols = [c for c in series_cols if c not in ("Home Court", "Seed (approx)")]
+
+            if rounds and comparison_cols:
+                st.subheader("Round-by-round comparison")
+                st.caption(
+                    "Grouped by round LABEL (\"Finals\" always means the championship round, regardless "
+                    "of how many total rounds existed that season) -- so a span with multiple runs to a "
+                    "round shows its combined performance across all of them, not per-appearance. "
+                    "Home Court and Seed aren't shown here since they don't aggregate across multiple "
+                    "series the same way a stat does."
+                )
+                stat_formats, stat_lower_is_better = formats_and_lower_is_better(SERIES_COLUMN_DEFS)
+                for round_label in rounds:
+                    round_df = build_round_comparison_table(spans_records, round_label, comparison_cols)
+                    if round_df.empty or round_df.isna().all(axis=None):
+                        continue
+                    st.markdown(
+                        render_stat_table_html(round_df, round_label, formats=stat_formats, lower_is_better=stat_lower_is_better),
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("<br>", unsafe_allow_html=True)
+                st.divider()
+
+            st.subheader("By player")
+            for agg in result.aggregates:
+                block = agg["playoffs"]
+                if block is None or "series_records" not in block:
+                    continue
+                display_df = build_series_table(block["series_records"], columns=series_cols)
+                st.markdown(
+                    render_series_table_html(display_df, columns=series_cols, title=agg["label"]),
+                    unsafe_allow_html=True,
+                )
+                st.markdown("<br>", unsafe_allow_html=True)
 
     awards_table = build_awards_table(valid_spans, accolade_store)
     if awards_table is not None:

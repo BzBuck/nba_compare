@@ -88,6 +88,19 @@ class NBADataStore:
         df = self._load(season_type)
         return df[(df.PLAYER_ID == player_id) & (df.SEASON.isin(seasons))]
 
+    def team_games_for_season(self, season: int, season_type: str = "regular") -> pd.DataFrame:
+        """ALL teams' games for one season (not filtered to one team) --
+        needed to work out league-wide playoff depth and rough standings."""
+        key = "team_regular" if season_type == "regular" else "team_playoffs"
+        df = self._load(key)
+        return df[df.SEASON == season]
+
+    def all_player_games_for_season(self, season: int, season_type: str = "regular") -> pd.DataFrame:
+        """ALL players' games for one season (not filtered to one player) --
+        needed to build league-wide percentile distributions."""
+        df = self._load(season_type)
+        return df[df.SEASON == season]
+
     def games_with_team_context(self, player_id: int, seasons: list[int], season_type: str) -> pd.DataFrame:
         """
         Same as games(), but left-joins each row with:

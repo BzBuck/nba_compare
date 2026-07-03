@@ -113,6 +113,28 @@ def flatten_block_for_formula(block: dict | None) -> dict:
     variables["WIN_PCT"] = (
         wins / (wins + losses) if wins is not None and losses is not None and (wins + losses) > 0 else None
     )
+
+    depth = block.get("depth") or {}
+    variables["CHAMPIONSHIPS"] = depth.get("championships")
+    variables["FINALS_APPS"] = depth.get("finals_apps")
+    variables["SERIES_W"] = depth.get("series_w")
+    variables["SERIES_L"] = depth.get("series_l")
+    variables["BEST_ROUND"] = depth.get("best_round_num")
+    variables["PLAYOFF_SEASONS"] = depth.get("seasons_in_playoffs")
+
+    pctile = block.get("percentiles") or {}
+    variables["PTS_PCTILE"] = pctile.get("PTS")
+    variables["REB_PCTILE"] = pctile.get("REB")
+    variables["AST_PCTILE"] = pctile.get("AST")
+    variables["STL_PCTILE"] = pctile.get("STL")
+    variables["BLK_PCTILE"] = pctile.get("BLK")
+    variables["TOV_PCTILE"] = pctile.get("TOV")
+    variables["FG_PCT_PCTILE"] = pctile.get("FG_PCT")
+    variables["FG3_PCT_PCTILE"] = pctile.get("FG3_PCT")
+    variables["FT_PCT_PCTILE"] = pctile.get("FT_PCT")
+    variables["EFG_PCT_PCTILE"] = pctile.get("EFG_PCT")
+    variables["TS_PCT_PCTILE"] = pctile.get("TS_PCT")
+
     return variables
 
 
@@ -127,4 +149,7 @@ AVAILABLE_VARIABLES = [
     "TSA_CV", "USG_EVENTS_CV", "TS_PCT_CV", "MIN_CV",
     "PTS_FLOOR", "REB_FLOOR", "AST_FLOOR", "STL_FLOOR", "BLK_FLOOR", "TOV_FLOOR",
     "FG3M_FLOOR", "FGM_FLOOR", "FTM_FLOOR", "TSA_FLOOR", "USG_EVENTS_FLOOR", "TS_PCT_FLOOR", "MIN_FLOOR",
+    "CHAMPIONSHIPS", "FINALS_APPS", "SERIES_W", "SERIES_L", "BEST_ROUND", "PLAYOFF_SEASONS",
+    "PTS_PCTILE", "REB_PCTILE", "AST_PCTILE", "STL_PCTILE", "BLK_PCTILE", "TOV_PCTILE",
+    "FG_PCT_PCTILE", "FG3_PCT_PCTILE", "FT_PCT_PCTILE", "EFG_PCT_PCTILE", "TS_PCT_PCTILE",
 ]

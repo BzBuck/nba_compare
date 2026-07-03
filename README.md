@@ -41,6 +41,16 @@ streamlit run app.py
   seasons, and stat selection as a code (or file) you can paste back in
   later, in a different session, after the app's code has changed. See
   "Save / Load" below for why this is safe against future edits.
+- **Playoff series breakdown**: expander below the tables with two views —
+  **Round-by-round comparison** (rows=stats, columns=spans, best value
+  highlighted — same visual style as the main box score table, one
+  section per round, so you can directly compare e.g. every span's
+  combined Finals performance) and **By player** (each span's series
+  listed chronologically). Season/Round/Opponent/Result are always
+  shown in the "By player" view; everything else (GP, W, L, and any box
+  score stat, plus Home Court and the approximate Seed) is toggleable and
+  drag-reorderable — the same picker feeds both views. See "Playoff depth
+  & series" below.
 
 Results render as a Stathead-style table — one row per stat, one column
 per span, best value in each row highlighted — split into separate
@@ -73,6 +83,8 @@ Code/
     │   ├── data.py                  NBADataStore -- loads/joins parquet
     │   ├── compare.py               stat computation + N-way comparison
     │   ├── table.py                 Stathead-style table + stat catalog
+    │   ├── playoffs.py              series/round/championship identification
+    │   ├── percentiles.py           league percentile ranks per season
     │   ├── formulas.py              safe evaluator for custom formulas
     │   ├── session_config.py        save/load format for app setups
     │   ├── players.py               player search helper for the UI
@@ -114,6 +126,13 @@ MIN/PTS/TRB/AST/STL/BLK/TS% Floor (P10)
 
 **Other** — +/- Std Dev
 
+**Playoff depth** — Championships, Finals Apps, Series W, Series L, Best
+Round Reached, Playoff Seasons (all span-level aggregates — see "Playoff
+depth & series" below for how these are derived)
+
+**League percentiles** — PTS/TRB/AST/STL/BLK/TOV/FG%/3P%/FT%/eFG%/TS% %ile
+(see "League percentiles" below)
+
 ### What CV% actually means
 
 Each stat's CV% is independent — a player's scoring volatility says
@@ -154,6 +173,109 @@ look plausible but are wrong. Rather than ship something unvalidated,
 this was intentionally left out — ask if you want it built as its own
 task, validated against known Basketball-Reference values before trusting it.
 
+### Playoff depth & series
+
+There's no bracket/schedule data source here — series, rounds, and
+championships are all inferred from the game logs themselves:
+
+- **Series** = a consecutive run of games against the same opponent for
+  one team in one season (opponent parsed from the `MATCHUP` field, which
+  the NBA stats API always writes as `"OWN @ OPP"` or `"OWN vs. OPP"`). A
+  team never faces two different playoff opponents interleaved within one
+  postseason, so this reliably separates series without needing an
+  explicit round/series ID.
+- **Round number** = that team's Nth series chronologically that
+  postseason. Correct regardless of how many rounds existed that era.
+- **Championship detection does NOT hardcode "round 4 = Finals."** It
+  looks at *every* team's playoff series that season (from the team-level
+  parquet) to find the actual deepest round reached league-wide that
+  year, then checks whether this team reached it and won. That keeps it
+  correct even in historical formats with a different number of rounds —
+  tested against a synthetic 2-round bracket where it correctly labeled
+  rounds "Round 1"/"Finals" (not the standard 4-round names) and only
+  flagged the true championship series, not an earlier round win.
+- **Seed is a clearly-flagged APPROXIMATION**, not real seeding: it ranks
+  teams by regular-season win% within a hardcoded conference table
+  (`playoffs.EASTERN_TEAMS`/`WESTERN_TEAMS`). It does **not** apply real
+  NBA tiebreakers (head-to-head, division record, etc.) and doesn't
+  account for play-in games (2020–present). Treat it as a rough "how good
+  was this team" signal, not an authoritative seed number.
+- **Home Court is exact, not an approximation** — whoever hosted Game 1
+  of a series had home court advantage for the whole series, by
+  definition. That's read straight from the same `MATCHUP` field already
+  used for opponent detection, on the series' first game specifically.
+  Verified against a synthetic bracket with a team having home court in
+  one series and playing on the road in another — both cases came back
+  correct.
+- **Round-by-round comparison groups by round LABEL, not round number.**
+  "Finals" always means the championship round, whether that season had
+  4 rounds or 2 — so a span's Finals runs across different-format eras
+  still bucket together correctly. If a span reached a round multiple
+  times, its column shows the combined performance across every
+  appearance (totals summed, then rates recomputed from those sums — not
+  an average of each series' rate, which would overweight short series).
+  Verified against a career-long span vs. a single-season subset of the
+  same player: their one shared Round 1 appearance showed identical
+  numbers, while Finals differed correctly since the career span included
+  multiple Finals runs the single-season span didn't.
+- **Round/championship detection uses TEAM-level games, not just the
+  player's own, specifically so injuries don't cost a player their
+  championship credit.** Round numbers and results come from
+  `team_series_structure()` (the team's full game log, which has no gaps),
+  and the player's own games are matched into that structure by
+  `GAME_ID` — a round the player has zero games in still produces a
+  correct record (marked `player_played: False`, shown as **(DNP)** in
+  the app) instead of silently disappearing. That matters twice over: a
+  missed round no longer mis-numbers every round after it, and a player
+  hurt for the clinching series still gets championship credit if the
+  team won it while they were on the roster. Verified against a
+  synthetic case where a player only has game rows for Round 1 of a
+  3-round bracket their team wins entirely — Round 2 and the Finals both
+  showed up correctly labeled, and Champion was correctly `True` on the
+  Finals row despite zero player games there. Before this fix, that
+  player would have shown zero championships for a season their team
+  actually won.
+  **Known limitation**: this requires the player to have appeared in at
+  least one game for that team that postseason — there's no roster data
+  here, only game logs, so a player who missed an *entire* postseason for
+  a team can't be picked up this way regardless of the fix.
+
+### League percentiles
+
+Where a player's per-game value for a stat ranks among every qualifying
+player in the league **that same season** — computed per season, never
+pooled across a span, since league context (pace, 3-point rate) shifts
+year to year. A span covering multiple seasons shows a games-weighted
+average of that season's percentile; seasons where the player didn't meet
+the minimum-games qualifier are excluded from the average entirely, not
+counted as a 0.
+
+Covers PTS, TRB, AST, STL, BLK, TOV, FG%, 3P%, FT%, eFG%, TS%. Turnovers
+are inverted internally (low TOV → high percentile), so every percentile
+column means the same thing: higher is always better, regardless of the
+underlying stat's direction — verified against a synthetic 6-player pool
+where a low-scoring, low-turnover player correctly landed with a low PTS
+percentile but a *high* TOV percentile, independently of each other.
+
+Qualifier: minimum 10 games for regular season, 1 game for playoffs
+(series are short, and playoff appearance is already a relevance filter).
+Adjustable via `min_games` in `percentiles.season_league_table()`.
+
+**Efficiency**: one grouped calculation per (season, season_type) covers
+every player in the league at once (~500 players from one pass over that
+season's rows) — it's not done per-player. Results are cached per
+`(store, season, season_type, min_games)`, so comparing multiple players
+or spans that share a season only pays that cost once. A full multi-player,
+multi-season comparison including percentiles ran in well under half a
+second in testing.
+
+**Not currently covered by percentiles**: usage%, team-context stats
+(ORtg/DRtg/Pace), and the consistency (CV%/Floor) stats. Adding usage%
+percentiles specifically would need the team-join run for every league
+player each season, not just the stats already summable straight from
+player game logs — a real efficiency step up from what's here now. Ask if
+you want that built.
+
 ## Custom formulas
 
 Combine any existing stat with `+ - * / **` and parentheses — e.g.
@@ -175,7 +297,9 @@ sidebar expander): counting stats per game (`PTS`, `REB`, `OREB`, `DREB`,
 `USG_VOL_G`), team context (`TEAM_PTS_G`, `TEAM_POSS_G`, `TEAM_PACE`,
 `TEAM_ORTG`, `TEAM_DRTG`, `TEAM_NET_RTG`), consistency (`*_CV` and
 `*_FLOOR` for every stat that has one, e.g. `PTS_CV`, `PTS_FLOOR`,
-`MIN_CV`, `TS_PCT_CV`).
+`MIN_CV`, `TS_PCT_CV`), playoff depth (`CHAMPIONSHIPS`, `FINALS_APPS`,
+`SERIES_W`, `SERIES_L`, `BEST_ROUND`, `PLAYOFF_SEASONS`), league
+percentiles (`*_PCTILE`, e.g. `PTS_PCTILE`, `TS_PCT_PCTILE`).
 
 ## Save / Load
 
