@@ -141,7 +141,12 @@ def render_stat_table_html(
     lower_is_better: set | None = None,
 ) -> str:
     """
-    Formats + highlights the best value per row, Stathead-style.
+    Formats + highlights the best (green) and worst (red) value per row,
+    Stathead-style. Worst is only highlighted with 3+ columns being
+    compared -- with exactly 2, every cell would be either best or worst,
+    which is just noise (it's the same information as "not green," shown
+    louder). Ties at either extreme aren't highlighted, since there's
+    nothing distinct to flag.
     Returns a standalone HTML string -- pass to st.markdown(html, unsafe_allow_html=True).
 
     formats/lower_is_better default to the main STAT_DEFS rules; pass the
@@ -161,15 +166,26 @@ def render_stat_table_html(
         values = df.loc[row_label]
         numeric = values.dropna()
         best = None
+        worst = None
         if len(numeric) > 1:
             best = numeric.min() if row_label in lower_is_better else numeric.max()
+        if len(numeric) >= 3:
+            worst = numeric.max() if row_label in lower_is_better else numeric.min()
+            if worst == best:
+                worst = None  # all tied at the extreme -- nothing distinct to flag red
 
         cells = []
         for col in df.columns:
             v = values[col]
             text = fmt_cell(row_label, v)
             is_best = best is not None and v == best
-            style = "font-weight:600;background:#1f3d2b;color:#7CFC9A;" if is_best else "color:#ddd;"
+            is_worst = (not is_best) and worst is not None and v == worst
+            if is_best:
+                style = "font-weight:600;background:#1f3d2b;color:#7CFC9A;"
+            elif is_worst:
+                style = "font-weight:600;background:#3d1f1f;color:#FC7C7C;"
+            else:
+                style = "color:#ddd;"
             cells.append(f'<td style="padding:5px 14px;{style}">{text}</td>')
 
         rows_html.append(

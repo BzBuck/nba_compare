@@ -55,6 +55,8 @@ if "stat_order" not in st.session_state:
     st.session_state.stat_order = list(DEFAULT_STAT_LABELS)
 if "series_col_order" not in st.session_state:
     st.session_state.series_col_order = list(DEFAULT_SERIES_COLUMNS)
+if "span_order" not in st.session_state:
+    st.session_state.span_order = []
 
 
 def add_span():
@@ -324,6 +326,26 @@ for cfg in st.session_state.spans:
             st.rerun()
 
 st.button("+ Add player / span", on_click=add_span)
+
+if len(valid_spans) > 1:
+    current_labels = [s.label for s in valid_spans]
+    if len(current_labels) != len(set(current_labels)):
+        st.caption(
+            "Give spans distinct labels above (the 'Label' field per row) to enable drag-reordering "
+            "-- duplicate names found, and dragging can't tell which one you mean."
+        )
+    else:
+        st.session_state.span_order = (
+            [l for l in st.session_state.span_order if l in current_labels]
+            + [l for l in current_labels if l not in st.session_state.span_order]
+        )
+        st.caption("Drag to reorder players/spans:")
+        span_sorter_key = "span_order_sorter_" + "|".join(sorted(st.session_state.span_order))
+        new_span_order = sort_items(st.session_state.span_order, key=span_sorter_key)
+        if new_span_order and set(new_span_order) == set(st.session_state.span_order):
+            st.session_state.span_order = new_span_order
+        label_to_span = {s.label: s for s in valid_spans}
+        valid_spans = [label_to_span[l] for l in st.session_state.span_order if l in label_to_span]
 
 st.divider()
 

@@ -27,7 +27,11 @@ streamlit run app.py
 
 - **Search and add players** by typing part of a name; add as many
   player+span rows as you want, including multiple spans of the same
-  player (e.g. "prime LeBron" vs. "current LeBron").
+  player (e.g. "prime LeBron" vs. "current LeBron"). **Drag to reorder**
+  which column each one appears in across every table (box score, round
+  comparisons, series listing) — requires giving spans with the same
+  default name distinct labels first, since dragging can't tell apart two
+  identically-named columns.
 - **Season range slider** per span (single season, a few years, or full
   career), plus independent toggles for regular season / playoffs.
 - **Customize stats shown**: pick exactly which stats appear from the full
