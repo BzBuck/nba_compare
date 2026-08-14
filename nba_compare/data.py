@@ -17,6 +17,12 @@ COUNTING_STATS = [
     "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
 ]
 
+# Minimum minutes EACH player in a duo must log in a game for it to count
+# as "played together" -- excludes token appearances (a garbage-time minute
+# in a blowout, an early exit to injury) that technically share a GAME_ID/
+# TEAM_ID but don't represent meaningful shared floor time.
+DUO_MIN_MINUTES = 10.0
+
 
 def _to_minutes(min_col: pd.Series) -> pd.Series:
     """Handle both plain numeric minutes and legacy 'MM:SS' string formats."""
@@ -139,6 +145,81 @@ class NBADataStore:
         merged = merged[(merged["OPP_TEAM_ID"].isna()) | (merged["OPP_TEAM_ID"] != merged["TEAM_ID"])]
         merged = merged.drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
         return merged
+
+    def seasons_together(
+        self, player_a_id: int, player_b_id: int, season_type: str = "regular",
+        min_minutes: float = DUO_MIN_MINUTES,
+    ) -> list[int]:
+        """
+        Seasons where the two players actually shared a team roster for at
+        least one QUALIFYING game that season_type (matched on GAME_ID +
+        TEAM_ID, each logging >= min_minutes -- see DUO_MIN_MINUTES) --
+        narrower than the mere intersection of each player's individual
+        seasons_played (see seasons_played()), which would also include
+        seasons they were both merely active in the league on different
+        teams. Same "played together" definition as games_together(), so a
+        season offered here always yields at least one qualifying game
+        there. Cheaper than games_together() -- just an ID join, no
+        team-context merge -- since callers only need the season list, not
+        full combined stats.
+        """
+        df = self._load(season_type)
+        a = df.loc[df.PLAYER_ID == player_a_id, ["GAME_ID", "TEAM_ID", "SEASON", "MIN_NUM"]]
+        b = df.loc[df.PLAYER_ID == player_b_id, ["GAME_ID", "TEAM_ID", "MIN_NUM"]]
+        shared = a.merge(b, on=["GAME_ID", "TEAM_ID"], how="inner", suffixes=("", "_b"))
+        shared = shared[(shared["MIN_NUM"] >= min_minutes) & (shared["MIN_NUM_b"] >= min_minutes)]
+        return sorted(shared["SEASON"].unique().tolist())
+
+    def games_together(
+        self, player_a_id: int, player_b_id: int, seasons: list[int], season_type: str,
+        min_minutes: float = DUO_MIN_MINUTES,
+    ) -> pd.DataFrame:
+        """
+        Combined per-game rows for games where both players were on the
+        SAME team roster for the SAME game (i.e. were teammates that game)
+        AND each logged at least min_minutes (see DUO_MIN_MINUTES) -- a
+        game where one of them only got token garbage-time/injury-exit
+        minutes doesn't count as "played together" and is dropped before
+        the box scores are combined. Matched on GAME_ID + TEAM_ID. Built
+        from games_with_team_context() for each player, so the result
+        carries the same TEAM_*/OPP_* context columns a single player's
+        games would, and can be fed into _stat_block() /
+        playoffs.compute_series_records() unmodified.
+
+        COUNTING_STATS + MIN_NUM + PLUS_MINUS are summed across the two
+        players. Everything else (GAME_ID, SEASON, TEAM_ID, MATCHUP,
+        GAME_DATE, WL, TEAM_MIN, TEAM_FGA, TEAM_PTS, OPP_*, ...) is a
+        game/team-level fact already identical for both players in a
+        shared game, so it's kept as-is from player A's row rather than
+        summed (summing it would double-count team/opponent context).
+
+        Also stashes each player's own MIN_NUM/FGA/FTA/TOV (over these
+        same qualifying games) under A_*/B_* columns. USG% is nonlinear in
+        minutes (minutes is the denominator), so unlike everything else
+        here it can't be correctly recomputed from combined totals -- it
+        has to be computed per player and then added (see compare.py's
+        _compute_usage). Everything else in this frame ignores these
+        extra columns.
+        """
+        a = self.games_with_team_context(player_a_id, seasons, season_type)
+        b = self.games_with_team_context(player_b_id, seasons, season_type)
+        if a.empty or b.empty:
+            return a.iloc[0:0].copy()
+
+        sum_cols = COUNTING_STATS + ["MIN_NUM", "PLUS_MINUS"]
+        b_slim = b[["GAME_ID", "TEAM_ID"] + sum_cols]
+
+        merged = a.merge(b_slim, on=["GAME_ID", "TEAM_ID"], how="inner", suffixes=("", "_b"))
+        merged = merged[(merged["MIN_NUM"] >= min_minutes) & (merged["MIN_NUM_b"] >= min_minutes)]
+
+        for c in ("MIN_NUM", "FGA", "FTA", "TOV"):
+            merged[f"A_{c}"] = merged[c]
+            merged[f"B_{c}"] = merged[f"{c}_b"]
+
+        for c in sum_cols:
+            merged[c] = merged[c] + merged[f"{c}_b"]
+            merged = merged.drop(columns=[f"{c}_b"])
+        return merged.reset_index(drop=True)
 
     def seasons_played(self, player_id: int, season_type: str = "regular") -> list[int]:
         df = self._load(season_type)

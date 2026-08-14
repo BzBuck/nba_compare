@@ -46,5 +46,35 @@ class PlayerSpan:
         return cls(player_id, player_name, all_seasons, **kwargs)
 
 
+@dataclass
+class DuoSpan:
+    """
+    Two teammates over a set of seasons, compared as their COMBINED numbers
+    for the games they actually shared (same GAME_ID + same TEAM_ID) --
+    not their individual careers added together. `seasons` narrows which
+    seasons to consider; the actual "were they teammates that game" filter
+    happens at the game level (see NBADataStore.games_together).
+    """
+    player_a_id: int
+    player_a_name: str
+    player_b_id: int
+    player_b_name: str
+    seasons: list[int]
+    label: str | None = None
+    include_regular: bool = True
+    include_playoffs: bool = True
+
+    def __post_init__(self):
+        self.seasons = sorted(set(self.seasons))
+        if self.label is None:
+            names = f"{self.player_a_name} & {self.player_b_name}"
+            if len(self.seasons) == 1:
+                self.label = f"{names} {_season_str(self.seasons[0])}"
+            else:
+                self.label = (
+                    f"{names} {_season_str(self.seasons[0])}–{_season_str(self.seasons[-1])}"
+                )
+
+
 def _season_str(start_year: int) -> str:
     return f"{start_year}-{str(start_year + 1)[-2:]}"

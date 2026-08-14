@@ -35,15 +35,20 @@ def serialize_config(
     stat_order: list[str],
     custom_formulas: list[dict],
     accolade_path: str = "",
+    duos: list[dict] | None = None,
 ) -> str:
     """
     spans: list of {"player_id": int, "player_name": str, "seasons": [int,...],
                      "label": str|None, "include_regular": bool, "include_playoffs": bool}
+    duos: list of {"player_a_id": int, "player_a_name": str, "player_b_id": int,
+                    "player_b_name": str, "seasons": [int,...], "label": str|None,
+                    "include_regular": bool, "include_playoffs": bool}
     Returns a compact base64 string, safe to copy/paste or save to a file.
     """
     payload = {
         "config_version": CONFIG_VERSION,
         "spans": spans,
+        "duos": duos or [],
         "stat_order": stat_order,
         "custom_formulas": custom_formulas,
         "accolade_path": accolade_path,
@@ -97,6 +102,31 @@ def deserialize_config(code: str) -> dict:
         except (TypeError, ValueError):
             continue  # malformed entry -- skip it, don't fail the whole load
 
+    duos_raw = payload.get("duos", [])
+    if not isinstance(duos_raw, list):
+        duos_raw = []
+    duos = []
+    for d in duos_raw:
+        if not isinstance(d, dict):
+            continue
+        pid_a, pid_b = d.get("player_a_id"), d.get("player_b_id")
+        seasons = d.get("seasons")
+        if pid_a is None or pid_b is None or not isinstance(seasons, list) or not seasons:
+            continue
+        try:
+            duos.append({
+                "player_a_id": int(pid_a),
+                "player_a_name": str(d.get("player_a_name", "")),
+                "player_b_id": int(pid_b),
+                "player_b_name": str(d.get("player_b_name", "")),
+                "seasons": [int(x) for x in seasons],
+                "label": d.get("label") if isinstance(d.get("label"), str) else None,
+                "include_regular": bool(d.get("include_regular", True)),
+                "include_playoffs": bool(d.get("include_playoffs", True)),
+            })
+        except (TypeError, ValueError):
+            continue  # malformed entry -- skip it, don't fail the whole load
+
     stat_order = payload.get("stat_order", [])
     stat_order = [s for s in stat_order if isinstance(s, str)] if isinstance(stat_order, list) else []
 
@@ -113,6 +143,7 @@ def deserialize_config(code: str) -> dict:
 
     return {
         "spans": spans,
+        "duos": duos,
         "stat_order": stat_order,
         "custom_formulas": formulas,
         "accolade_path": accolade_path,

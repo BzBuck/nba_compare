@@ -349,7 +349,9 @@ SERIES_COLUMN_DEFS = {
 DEFAULT_SERIES_COLUMNS = ["GP", "W", "L", "PTS/G", "TS%", "Home Court", "Seed (approx)"]
 
 
-def compute_series_records(store: NBADataStore, player_games: pd.DataFrame) -> list[dict]:
+def compute_series_records(
+    store: NBADataStore, player_games: pd.DataFrame, wl_from_player_games: bool = False
+) -> list[dict]:
     """
     One dict per series the player's TEAM played that postseason -- round,
     opponent, and result come from TEAM-level data (identify_series_for_player),
@@ -363,6 +365,17 @@ def compute_series_records(store: NBADataStore, player_games: pd.DataFrame) -> l
     user-chosen subset of columns from it for display -- kept separate so
     depth_summary() always sees the complete picture regardless of what
     the UI has toggled on.
+
+    wl_from_player_games: when True, each record's "w"/"l" fields (the
+    numbers shown in the GP/W/L columns and summed across series by
+    aggregate_series_group) come from player_games' OWN WL column instead
+    of the team's full series log. Used for DuoSpans, where player_games
+    is already restricted to games the duo actually shared at real
+    minutes (see NBADataStore.games_together) -- so their personal record
+    doesn't get credited or blamed for games one half of the duo didn't
+    play in. "Result" and "Champion" always reflect the TEAM's actual
+    series outcome regardless of this flag -- those are facts about the
+    series itself, not about who was on the floor for it.
     """
     series_infos = identify_series_for_player(store, player_games)
     if not series_infos:
@@ -397,6 +410,12 @@ def compute_series_records(store: NBADataStore, player_games: pd.DataFrame) -> l
         seed_info = estimate_conference_seed(store, team_abbr, season) if team_abbr else None
 
         played = len(player_g)
+        if wl_from_player_games:
+            record_w = int((player_g["WL"] == "W").sum()) if played else 0
+            record_l = int((player_g["WL"] == "L").sum()) if played else 0
+        else:
+            record_w, record_l = team_wins, team_losses
+
         records.append({
             "Season": f"{season}-{str(season + 1)[-2:]}",
             "SeasonSort": season,
@@ -405,8 +424,8 @@ def compute_series_records(store: NBADataStore, player_games: pd.DataFrame) -> l
             "Opponent": opponent,
             "Result": "Won" if team_wins > team_losses else "Lost",
             "Champion": is_champion,
-            "w": team_wins,
-            "l": team_losses,
+            "w": record_w,
+            "l": record_l,
             "stats": _series_stat_block(player_g) if played else _empty_series_stat_block(),
             "home_court": home_court,
             "seed": seed_info["estimated_seed"] if seed_info else None,

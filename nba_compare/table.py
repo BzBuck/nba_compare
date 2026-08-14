@@ -8,6 +8,7 @@ Kept separate from viz.py since this renders as HTML/dataframe, not Plotly.
 from __future__ import annotations
 import pandas as pd
 from .compare import ComparisonResult
+from .models import DuoSpan
 
 # label -> (getter(stat_block) -> value, display format, lower_is_better)
 # A dict (not a list) so the UI can let the user pick + reorder a subset by
@@ -41,8 +42,10 @@ STAT_DEFS = {
     "Team ORtg":  (lambda b: (b["team"] or {}).get("team_ortg"),        "{:.1f}", False),
     "Team DRtg":  (lambda b: (b["team"] or {}).get("team_drtg"),        "{:.1f}", True),
     "Net Rtg":    (lambda b: (b["team"] or {}).get("team_net_rtg"),     "{:+.1f}", False),
+    "Team MOV":   (lambda b: (b["team"] or {}).get("team_mov"),         "{:+.1f}", False),
     "Team W%":    (lambda b: (b["wins"] / (b["wins"] + b["losses"]))
                              if b["wins"] is not None and (b["wins"] + b["losses"]) > 0 else None, "{:.3f}", False),
+    "Avg Seed (approx)": (lambda b: b.get("avg_seed"),                  "{:.1f}", True),
     "MIN Floor (P10)": (lambda b: b["consistency"]["MIN"]["floor"],     "{:.1f}", False),
     "PTS Floor (P10)": (lambda b: b["consistency"]["PTS"]["floor"],     "{:.1f}", False),
     "TRB Floor (P10)": (lambda b: b["consistency"]["REB"]["floor"],     "{:.1f}", False),
@@ -208,16 +211,44 @@ def render_stat_table_html(
     """
 
 
+def _sum_accolade_blocks(a: dict, b: dict) -> dict:
+    """Combine two players' accolades.block() dicts into one, for a duo --
+    scalar counts add, tier-count dicts (all_nba/all_defense) merge by key."""
+    all_nba = dict(a["all_nba"])
+    for k, v in b["all_nba"].items():
+        all_nba[k] = all_nba.get(k, 0) + v
+    all_defense = dict(a["all_defense"])
+    for k, v in b["all_defense"].items():
+        all_defense[k] = all_defense.get(k, 0) + v
+    return {
+        "all_star": a["all_star"] + b["all_star"],
+        "all_nba": all_nba,
+        "all_defense": all_defense,
+        "mvp_shares": a["mvp_shares"] + b["mvp_shares"],
+        "championships": a["championships"] + b["championships"],
+        "finals_mvp": a["finals_mvp"] + b["finals_mvp"],
+    }
+
+
 def build_awards_table(spans, accolade_store) -> pd.DataFrame | None:
     """
     Returns None if the accolade store has no data loaded (default state --
-    see accolades.py for how to wire in a real source).
+    see accolades.py for how to wire in a real source). Awards are
+    season-level, not game-level, data -- so a DuoSpan's row is simply both
+    players' individual awards summed over the span's seasons, not scoped
+    to games they shared as teammates the way the box-score stats are.
     """
     if accolade_store is None or accolade_store.df.empty:
         return None
     data = {}
     for span in spans:
-        block = accolade_store.block(span.player_id, span.seasons)
+        if isinstance(span, DuoSpan):
+            block = _sum_accolade_blocks(
+                accolade_store.block(span.player_a_id, span.seasons),
+                accolade_store.block(span.player_b_id, span.seasons),
+            )
+        else:
+            block = accolade_store.block(span.player_id, span.seasons)
         data[span.label] = {
             "All-Star": block["all_star"],
             "All-NBA": sum(block["all_nba"].values()) if block["all_nba"] else 0,

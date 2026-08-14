@@ -5,7 +5,7 @@ N-way comparisons across spans (players, years, or mixed).
 from __future__ import annotations
 import pandas as pd
 from .data import NBADataStore, COUNTING_STATS
-from .models import PlayerSpan
+from .models import PlayerSpan, DuoSpan
 from . import playoffs as _playoffs
 from . import percentiles as _percentiles
 
@@ -41,6 +41,21 @@ def _compute_usage(games_with_team: pd.DataFrame) -> dict | None:
     if player_min and team_usage_events:
         usg_pct = 100 * (player_usage_events * (team_min / 5)) / (player_min * team_usage_events)
 
+    # For a DUO's combined games (see NBADataStore.games_together), MIN_NUM/
+    # FGA/FTA/TOV above are the two players' SUMMED totals -- fine for every
+    # other stat here (linear), but USG% has minutes in the denominator, so
+    # summing minutes first biases the ratio instead of just adding the two
+    # players' own shares. games_together() stashes each player's own
+    # MIN_NUM/FGA/FTA/TOV (over the same games) under A_*/B_* columns
+    # specifically so it can be computed correctly per player and added --
+    # which IS how USG% combines (it's each player's share of team plays,
+    # and shares simply add).
+    if "A_MIN_NUM" in valid.columns:
+        usg_a = _single_usg_pct(valid, "A")
+        usg_b = _single_usg_pct(valid, "B")
+        if usg_a is not None and usg_b is not None:
+            usg_pct = usg_a + usg_b
+
     # MIN% -- share of the team's total floor time this player occupied.
     # Same shape of calc as USG% but simpler: no possession-event estimate,
     # just player minutes over (team minutes / 5), aggregated across the span.
@@ -55,6 +70,20 @@ def _compute_usage(games_with_team: pd.DataFrame) -> dict | None:
         "games_with_team_data": n,
         "games_missing_team_data": len(games_with_team) - n,
     }
+
+
+def _single_usg_pct(valid: pd.DataFrame, prefix: str) -> float | None:
+    """USG% for one half of a duo, from that player's own A_*/B_* minutes
+    and events (see NBADataStore.games_together) against the shared
+    TEAM_* totals -- same formula as the single-player case in
+    _compute_usage, just scoped to one player's own numbers."""
+    player_min = valid[f"{prefix}_MIN_NUM"].sum()
+    player_events = (valid[f"{prefix}_FGA"] + 0.44 * valid[f"{prefix}_FTA"] + valid[f"{prefix}_TOV"]).sum()
+    team_min = valid["TEAM_MIN"].sum()
+    team_events = (valid["TEAM_FGA"] + 0.44 * valid["TEAM_FTA"] + valid["TEAM_TOV"]).sum()
+    if not player_min or not team_events:
+        return None
+    return 100 * (player_events * (team_min / 5)) / (player_min * team_events)
 
 
 def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
@@ -73,6 +102,13 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
     to a 48-minute game via team minutes played -- this is why it needed
     TEAM_MIN, which wasn't wired into anything until now):
       Pace = 48 * ((team_poss + opp_poss) / (2 * (team_MIN / 5)))
+
+    Margin of victory (MOV) is the plain, un-pace-adjusted average scoring
+    margin (team points - opponent points, per game) -- distinct from Net
+    Rtg, which is the same idea but normalized to per-100-possessions so
+    it's comparable across different paces. MOV only needs TEAM_PTS/
+    OPP_PTS, so it's computed off its own (looser) subset rather than
+    piggybacking on the fuller ORtg/DRtg possession-column requirements.
     """
     valid = games_with_team.dropna(subset=["TEAM_PTS", "TEAM_FGA", "TEAM_OREB", "TEAM_FTA", "TEAM_TOV"])
     if valid.empty:
@@ -88,6 +124,7 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
         "team_drtg": None,
         "team_net_rtg": None,
         "team_pace": None,
+        "team_mov": None,
     }
 
     valid_opp = games_with_team.dropna(subset=["OPP_PTS", "OPP_FGA", "OPP_OREB", "OPP_FTA", "OPP_TOV"])
@@ -98,6 +135,10 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
 
     if result["team_ortg"] is not None and result["team_drtg"] is not None:
         result["team_net_rtg"] = result["team_ortg"] - result["team_drtg"]
+
+    valid_mov = games_with_team.dropna(subset=["TEAM_PTS", "OPP_PTS"])
+    if not valid_mov.empty:
+        result["team_mov"] = (valid_mov["TEAM_PTS"] - valid_mov["OPP_PTS"]).mean()
 
     pace_cols = ["TEAM_MIN", "TEAM_FGA", "TEAM_OREB", "TEAM_FTA", "TEAM_TOV",
                  "OPP_FGA", "OPP_OREB", "OPP_FTA", "OPP_TOV"]
@@ -221,14 +262,37 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
     }
 
 
+def _regular_season_seed(store: NBADataStore, games: pd.DataFrame) -> float | None:
+    """
+    Average approximate conference seed (see playoffs.estimate_conference_seed)
+    across every season in `games`, using whichever team the most of that
+    season's games belong to (handles a mid-season trade the same way
+    playoffs.compute_series_records() does -- pick the dominant team for
+    the season, don't try to average across teams). Regular season only --
+    a team's win%-rank standing exists whether or not this player (or duo)
+    made the playoffs that year. Seasons where the seed can't be
+    determined (conference/data missing) are excluded rather than counted
+    as 0, and the whole thing is None if there's nothing to average.
+    """
+    if games.empty or "TEAM_ABBREVIATION" not in games.columns:
+        return None
+    seeds = []
+    for season, g in games.groupby("SEASON"):
+        team_abbr = g["TEAM_ABBREVIATION"].value_counts().idxmax()
+        info = _playoffs.estimate_conference_seed(store, team_abbr, int(season))
+        if info is not None:
+            seeds.append(info["estimated_seed"])
+    return sum(seeds) / len(seeds) if seeds else None
+
+
 def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
     result = {"span": span, "label": span.label, "regular": None, "playoffs": None}
     if span.include_regular:
-        result["regular"] = _stat_block(
-            store.games_with_team_context(span.player_id, span.seasons, "regular")
-        )
+        reg_games = store.games_with_team_context(span.player_id, span.seasons, "regular")
+        result["regular"] = _stat_block(reg_games)
         if result["regular"] is not None:
             result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
+            result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
     if span.include_playoffs:
         result["playoffs"] = _stat_block(
             store.games_with_team_context(span.player_id, span.seasons, "playoffs")
@@ -242,8 +306,37 @@ def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
     return result
 
 
-def compare_spans(spans: list[PlayerSpan], store: NBADataStore) -> "ComparisonResult":
-    aggregates = [aggregate_span(s, store) for s in spans]
+def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
+    """
+    Same shape of result as aggregate_span(), but built from the two
+    players' COMBINED numbers for games they shared as teammates (see
+    NBADataStore.games_together) instead of one player's games. No
+    "percentiles" key -- league percentiles are a single-player-distribution
+    concept and a duo's combined per-game value would trivially read near
+    the 100th percentile, so it's omitted rather than shown misleadingly
+    (table.py's getters already treat a missing percentiles key as "--").
+    """
+    result = {"span": duo, "label": duo.label, "regular": None, "playoffs": None}
+    if duo.include_regular:
+        reg_games = store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, "regular")
+        result["regular"] = _stat_block(reg_games)
+        if result["regular"] is not None:
+            result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
+    if duo.include_playoffs:
+        games = store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, "playoffs")
+        result["playoffs"] = _stat_block(games)
+        if result["playoffs"] is not None:
+            records = _playoffs.compute_series_records(store, games, wl_from_player_games=True)
+            result["playoffs"]["series_records"] = records
+            result["playoffs"]["depth"] = _playoffs.depth_summary(records)
+    return result
+
+
+def compare_spans(spans: list[PlayerSpan | DuoSpan], store: NBADataStore) -> "ComparisonResult":
+    aggregates = [
+        aggregate_duo_span(s, store) if isinstance(s, DuoSpan) else aggregate_span(s, store)
+        for s in spans
+    ]
     return ComparisonResult(aggregates)
 
 
