@@ -18,7 +18,7 @@ from nba_compare.table import (
     build_stat_table, render_stat_table_html, build_awards_table,
     formats_and_lower_is_better, STAT_DEFS, DEFAULT_STAT_LABELS,
 )
-from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_formula, AVAILABLE_VARIABLES
+from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_formula
 from nba_compare.session_config import serialize_config, deserialize_config, ConfigError
 from nba_compare.playoffs import (
     render_series_table_html, build_series_table, SERIES_COLUMN_DEFS, DEFAULT_SERIES_COLUMNS,
@@ -236,7 +236,7 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             # before trusting them -- a variable the save relied on might
             # have been renamed/removed since. Invalid ones are dropped,
             # not silently kept broken.
-            sample_vars = {v: 1.0 for v in AVAILABLE_VARIABLES}
+            sample_vars = {v: 1.0 for v in STAT_DEFS}
             valid_formulas, dropped_formulas = [], []
             for f in cfg["custom_formulas"]:
                 if validate_formula(f["expr"], sample_vars):
@@ -279,18 +279,19 @@ accolade_store = AccoladeStore(accolade_path) if accolade_path else None
 
 st.sidebar.header("Custom stat formulas")
 st.sidebar.caption(
-    "Combine existing stats with + - * / and parentheses, e.g. `PTS / USG_VOL_G` "
-    "for points per used possession."
+    "Combine existing stats -- using the exact names shown in the table below "
+    "(e.g. `PTS/G`, `TS%`, `USG Vol/G`) -- with + - * / and parentheses, e.g. "
+    "`PTS/G / USG Vol/G` for points per used possession."
 )
 with st.sidebar.expander("Available variable names"):
-    st.code(", ".join(AVAILABLE_VARIABLES), language=None)
+    st.code(", ".join(STAT_DEFS), language=None)
 
 with st.sidebar.form("add_formula_form", clear_on_submit=True):
     new_label = st.text_input("Stat name", placeholder="Pts per Use")
-    new_expr = st.text_input("Formula", placeholder="PTS / USG_VOL_G")
+    new_expr = st.text_input("Formula", placeholder="PTS/G / USG Vol/G")
     submitted = st.form_submit_button("Add formula")
     if submitted:
-        sample_vars = {v: 1.0 for v in AVAILABLE_VARIABLES}  # syntax/name check only
+        sample_vars = {v: 1.0 for v in STAT_DEFS}  # syntax/name check only
         error = validate_formula(new_expr, sample_vars)
         if not new_label.strip():
             st.sidebar.error("Give the stat a name.")
@@ -327,7 +328,7 @@ if st.session_state.custom_formulas:
 combined_stat_defs = dict(STAT_DEFS)
 for f in st.session_state.custom_formulas:
     combined_stat_defs[f["label"]] = (
-        lambda block, expr=f["expr"]: safe_eval(expr, flatten_block_for_formula(block)),
+        lambda block, expr=f["expr"]: safe_eval(expr, flatten_block_for_formula(block, STAT_DEFS)),
         "{:.3f}",
         False,
     )

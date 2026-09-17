@@ -262,6 +262,32 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
     }
 
 
+def _relative_shooting(store: NBADataStore, games: pd.DataFrame, shooting: dict, season_type: str) -> dict:
+    """
+    Each shooting rate in `shooting` minus the games-weighted league
+    average for the same season(s) (see percentiles.span_league_average)
+    -- e.g. rTS_PCT = +0.032 means 3.2 percentage points better than
+    league average across these exact seasons. Weighted by how many games
+    THIS span actually has in each season (from `games` itself), so a
+    Duo's relative shooting is weighted toward the seasons/games they
+    actually shared, not the league's own game counts.
+
+    Unlike percentiles, this is meaningful for a Duo too -- it's plain
+    subtraction against a league baseline, not a rank against a
+    single-player distribution.
+    """
+    stats = _percentiles.RELATIVE_SHOOTING_STATS
+    if games.empty or "SEASON" not in games.columns:
+        return {stat: None for stat in stats}
+    games_by_season = games.groupby("SEASON").size().to_dict()
+    league = _percentiles.span_league_average(store, games_by_season, season_type)
+    return {
+        stat: (shooting[stat] - league[stat])
+        if shooting.get(stat) is not None and league.get(stat) is not None else None
+        for stat in stats
+    }
+
+
 def _regular_season_seed(store: NBADataStore, games: pd.DataFrame) -> float | None:
     """
     Average approximate conference seed (see playoffs.estimate_conference_seed)
@@ -293,12 +319,17 @@ def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
         if result["regular"] is not None:
             result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
+            result["regular"]["relative_shooting"] = _relative_shooting(
+                store, reg_games, result["regular"]["shooting"], "regular"
+            )
     if span.include_playoffs:
-        result["playoffs"] = _stat_block(
-            store.games_with_team_context(span.player_id, span.seasons, "playoffs")
-        )
+        po_games = store.games_with_team_context(span.player_id, span.seasons, "playoffs")
+        result["playoffs"] = _stat_block(po_games)
         if result["playoffs"] is not None:
             result["playoffs"]["percentiles"] = _percentiles.span_percentiles(store, span, "playoffs")
+            result["playoffs"]["relative_shooting"] = _relative_shooting(
+                store, po_games, result["playoffs"]["shooting"], "playoffs"
+            )
             raw_playoff_games = store.games(span.player_id, span.seasons, "playoffs")
             records = _playoffs.compute_series_records(store, raw_playoff_games)
             result["playoffs"]["series_records"] = records
@@ -322,10 +353,16 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
         result["regular"] = _stat_block(reg_games)
         if result["regular"] is not None:
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
+            result["regular"]["relative_shooting"] = _relative_shooting(
+                store, reg_games, result["regular"]["shooting"], "regular"
+            )
     if duo.include_playoffs:
         games = store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, "playoffs")
         result["playoffs"] = _stat_block(games)
         if result["playoffs"] is not None:
+            result["playoffs"]["relative_shooting"] = _relative_shooting(
+                store, games, result["playoffs"]["shooting"], "playoffs"
+            )
             records = _playoffs.compute_series_records(store, games, wl_from_player_games=True)
             result["playoffs"]["series_records"] = records
             result["playoffs"]["depth"] = _playoffs.depth_summary(records)

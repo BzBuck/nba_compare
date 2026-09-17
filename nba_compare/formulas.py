@@ -1,16 +1,24 @@
 """
 Lets you define custom stats as formulas over existing ones, e.g.
-"PTS / USG_VOL_G" for "points per used possession".
+"PTS/G / USG Vol/G" for "points per used possession" -- using the EXACT
+same stat labels shown in the comparison table (table.STAT_DEFS), not a
+separate internal variable-naming scheme. That includes labels with
+characters that aren't valid in a bare identifier, like "MIN/G", "TS%",
+"+/-", or "MIN Floor (P10)".
 
-This is NOT Python's eval() -- it walks the parsed expression tree and only
-allows numbers, known variable names, and +, -, *, /, ** (and parentheses,
-which the parser handles automatically). No function calls, no attribute
-access, no indexing, nothing else. A formula like "__import__('os')" is a
-syntax the walker doesn't recognize and rejects, not something it executes.
+This is NOT Python's eval() -- known stat labels are swapped for safe
+placeholder identifiers BEFORE parsing (so "MIN/G" is treated as one
+atomic value, not read as MIN divided by G), then the substituted
+expression is walked as an AST that only allows numbers, those
+placeholders, and +, -, *, /, ** (and parentheses, which the parser
+handles automatically). No function calls, no attribute access, no
+indexing, nothing else. A formula like "__import__('os')" is a syntax the
+walker doesn't recognize and rejects, not something it executes.
 """
 from __future__ import annotations
 import ast
 import operator
+import re
 
 _ALLOWED_BINOPS = {
     ast.Add: operator.add,
@@ -52,14 +60,44 @@ def _eval_node(node, variables: dict):
     raise FormulaError(f"Unsupported expression near: {ast.dump(node)}")
 
 
+def _tokenize_stat_labels(expr: str, variables: dict) -> tuple[str, dict]:
+    """
+    Stat labels (the keys of `variables`) can contain characters that
+    aren't valid in a bare Python identifier -- '/', '%', '+', '-',
+    spaces, parentheses (e.g. "MIN/G", "TS%", "+/-", "MIN Floor (P10)").
+    Swaps every occurrence of a known label for a safe placeholder
+    identifier BEFORE handing the expression to ast.parse, longest labels
+    first so e.g. "TS% %ile" isn't chopped up by a "TS%" match winning
+    first at the same starting position. Returns the substituted
+    expression plus a {placeholder: value} dict for _eval_node.
+    """
+    labels = sorted(variables.keys(), key=len, reverse=True)
+    if not labels:
+        return expr, {}
+    pattern = re.compile("|".join(re.escape(label) for label in labels))
+    placeholder_values: dict[str, object] = {}
+
+    def _replace(match: re.Match) -> str:
+        placeholder = f"__v{len(placeholder_values)}__"
+        placeholder_values[placeholder] = variables[match.group(0)]
+        return placeholder
+
+    return pattern.sub(_replace, expr), placeholder_values
+
+
 def safe_eval(expr: str, variables: dict):
-    """Evaluates expr using only the given variables. Raises FormulaError on
-    anything outside +,-,*,/,**, parentheses, numbers, and known names."""
+    """
+    Evaluates expr using only the given variables, keyed by stat label
+    (e.g. "MIN/G", "TS%", "PTS %ile") exactly as shown in the comparison
+    table. Raises FormulaError on anything outside +,-,*,/,**,
+    parentheses, numbers, and known stat labels.
+    """
+    substituted, placeholder_values = _tokenize_stat_labels(expr, variables)
     try:
-        tree = ast.parse(expr, mode="eval")
+        tree = ast.parse(substituted, mode="eval")
     except SyntaxError as e:
         raise FormulaError(f"Invalid formula syntax: {e}")
-    return _eval_node(tree, variables)
+    return _eval_node(tree, placeholder_values)
 
 
 def validate_formula(expr: str, sample_variables: dict) -> str | None:
@@ -73,83 +111,28 @@ def validate_formula(expr: str, sample_variables: dict) -> str | None:
         return str(e)
 
 
-# Variables available in formulas, pulled from a single span's stat block for
-# one season type. Missing/inapplicable values come through as None, and
-# safe_eval propagates None rather than raising (so PTS/USG_VOL_G on a span
-# with no team data just shows "--" instead of crashing).
-def flatten_block_for_formula(block: dict | None) -> dict:
+def flatten_block_for_formula(block: dict | None, stat_defs: dict) -> dict:
+    """
+    {label: value} for every stat in stat_defs, evaluated against block --
+    the exact labels table.py shows in the comparison table, so a custom
+    formula can reference any built-in stat exactly as it's displayed
+    there (no separate internal naming scheme to learn, and any stat
+    added to STAT_DEFS becomes formula-usable automatically). A getter
+    that raises (missing data for this block) contributes None rather
+    than failing the whole formula -- same as table.py's build_stat_table.
+
+    stat_defs is deliberately the caller's BUILT-IN stat_defs (e.g.
+    table.STAT_DEFS), not a dict that also includes other custom
+    formulas -- custom formulas can't reference each other, only
+    built-ins, which avoids chaining/self-reference/evaluation-order
+    issues entirely.
+    """
     if block is None:
         return {}
     variables = {}
-    variables.update(block.get("per_game", {}))       # PTS, REB, AST, STL, BLK, TOV, PF, FGM, FGA, FG3M, FG3A, FTM, FTA
-    variables.update(block.get("shooting", {}))        # FG_PCT, FG3_PCT, FT_PCT, EFG_PCT, TS_PCT
-
-    variables["TSA_G"] = block.get("tsa_per_game")
-    variables["MIN_G"] = block.get("minutes_per_game")
-    variables["PLUS_MINUS"] = block.get("plus_minus_per_game")
-    variables["PLUS_MINUS_STD"] = block.get("plus_minus_std")
-    variables["W"] = block.get("wins")
-    variables["L"] = block.get("losses")
-
-    usage = block.get("usage") or {}
-    variables["USG_PCT"] = usage.get("usg_pct")
-    variables["USG_VOL_G"] = usage.get("usage_per_game")
-    variables["MIN_PCT"] = usage.get("min_pct")
-
-    team = block.get("team") or {}
-    variables["TEAM_PTS_G"] = team.get("team_pts_per_game")
-    variables["TEAM_POSS_G"] = team.get("team_poss_per_game")
-    variables["TEAM_PACE"] = team.get("team_pace")
-    variables["TEAM_ORTG"] = team.get("team_ortg")
-    variables["TEAM_DRTG"] = team.get("team_drtg")
-    variables["TEAM_NET_RTG"] = team.get("team_net_rtg")
-
-    for stat, vals in block.get("consistency", {}).items():
-        variables[f"{stat}_CV"] = vals.get("cv_pct")
-        variables[f"{stat}_FLOOR"] = vals.get("floor")
-
-    variables["GP"] = block.get("games")
-    wins, losses = block.get("wins"), block.get("losses")
-    variables["WIN_PCT"] = (
-        wins / (wins + losses) if wins is not None and losses is not None and (wins + losses) > 0 else None
-    )
-
-    depth = block.get("depth") or {}
-    variables["CHAMPIONSHIPS"] = depth.get("championships")
-    variables["FINALS_APPS"] = depth.get("finals_apps")
-    variables["SERIES_W"] = depth.get("series_w")
-    variables["SERIES_L"] = depth.get("series_l")
-    variables["BEST_ROUND"] = depth.get("best_round_num")
-    variables["PLAYOFF_SEASONS"] = depth.get("seasons_in_playoffs")
-
-    pctile = block.get("percentiles") or {}
-    variables["PTS_PCTILE"] = pctile.get("PTS")
-    variables["REB_PCTILE"] = pctile.get("REB")
-    variables["AST_PCTILE"] = pctile.get("AST")
-    variables["STL_PCTILE"] = pctile.get("STL")
-    variables["BLK_PCTILE"] = pctile.get("BLK")
-    variables["TOV_PCTILE"] = pctile.get("TOV")
-    variables["FG_PCT_PCTILE"] = pctile.get("FG_PCT")
-    variables["FG3_PCT_PCTILE"] = pctile.get("FG3_PCT")
-    variables["FT_PCT_PCTILE"] = pctile.get("FT_PCT")
-    variables["EFG_PCT_PCTILE"] = pctile.get("EFG_PCT")
-    variables["TS_PCT_PCTILE"] = pctile.get("TS_PCT")
-
+    for label, (getter, _fmt, _lower) in stat_defs.items():
+        try:
+            variables[label] = getter(block)
+        except Exception:
+            variables[label] = None
     return variables
-
-
-AVAILABLE_VARIABLES = [
-    "PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF",
-    "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
-    "FG_PCT", "FG3_PCT", "FT_PCT", "EFG_PCT", "TS_PCT", "TSA_G", "MIN_G",
-    "PLUS_MINUS", "PLUS_MINUS_STD", "W", "L", "GP", "WIN_PCT",
-    "USG_PCT", "USG_VOL_G", "MIN_PCT",
-    "TEAM_PTS_G", "TEAM_POSS_G", "TEAM_PACE", "TEAM_ORTG", "TEAM_DRTG", "TEAM_NET_RTG",
-    "PTS_CV", "REB_CV", "AST_CV", "STL_CV", "BLK_CV", "TOV_CV", "FG3M_CV", "FGM_CV", "FTM_CV",
-    "TSA_CV", "USG_EVENTS_CV", "TS_PCT_CV", "MIN_CV",
-    "PTS_FLOOR", "REB_FLOOR", "AST_FLOOR", "STL_FLOOR", "BLK_FLOOR", "TOV_FLOOR",
-    "FG3M_FLOOR", "FGM_FLOOR", "FTM_FLOOR", "TSA_FLOOR", "USG_EVENTS_FLOOR", "TS_PCT_FLOOR", "MIN_FLOOR",
-    "CHAMPIONSHIPS", "FINALS_APPS", "SERIES_W", "SERIES_L", "BEST_ROUND", "PLAYOFF_SEASONS",
-    "PTS_PCTILE", "REB_PCTILE", "AST_PCTILE", "STL_PCTILE", "BLK_PCTILE", "TOV_PCTILE",
-    "FG_PCT_PCTILE", "FG3_PCT_PCTILE", "FT_PCT_PCTILE", "EFG_PCT_PCTILE", "TS_PCT_PCTILE",
-]

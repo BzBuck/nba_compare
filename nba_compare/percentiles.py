@@ -29,6 +29,12 @@ PERCENTILE_STATS = {
     "FG_PCT": True, "FG3_PCT": True, "FT_PCT": True, "EFG_PCT": True, "TS_PCT": True,
 }
 
+# Shooting rates that get a "relative to league" version (see
+# league_average_rates/span_league_average) -- unlike percentiles, "value
+# minus league average" is meaningful for a Duo too, since it's just
+# subtraction rather than a rank against a single-player distribution.
+RELATIVE_SHOOTING_STATS = ["FG_PCT", "FG3_PCT", "FT_PCT", "EFG_PCT", "TS_PCT"]
+
 
 @lru_cache(maxsize=64)
 def season_league_table(
@@ -123,3 +129,58 @@ def span_percentiles(store: NBADataStore, span: PlayerSpan, season_type: str = "
         stat: sum(p[stat] * p["gp"] for p in per_season) / total_gp if total_gp else None
         for stat in PERCENTILE_STATS
     }
+
+
+@lru_cache(maxsize=64)
+def league_average_rates(store: NBADataStore, season: int, season_type: str = "regular") -> dict:
+    """
+    League-wide shooting rates for one season, from EVERY game that
+    season (not just qualifying players the way season_league_table()
+    filters -- a league average should reflect the whole league's actual
+    shooting, same as Basketball-Reference's league-average row). Totals
+    summed first, rates computed once -- same approach used everywhere
+    else in this project, not an average of individual players' rates
+    (which would overweight low-volume shooters).
+    """
+    games = store.all_player_games_for_season(season, season_type)
+    if games.empty:
+        return {}
+    fgm, fga = games["FGM"].sum(), games["FGA"].sum()
+    fg3m, fg3a = games["FG3M"].sum(), games["FG3A"].sum()
+    ftm, fta = games["FTM"].sum(), games["FTA"].sum()
+    pts = games["PTS"].sum()
+    return {
+        "FG_PCT": fgm / fga if fga else None,
+        "FG3_PCT": fg3m / fg3a if fg3a else None,
+        "FT_PCT": ftm / fta if fta else None,
+        "EFG_PCT": (fgm + 0.5 * fg3m) / fga if fga else None,
+        "TS_PCT": pts / (2 * (fga + 0.44 * fta)) if (fga or fta) else None,
+    }
+
+
+def span_league_average(
+    store: NBADataStore, games_by_season: dict[int, int], season_type: str = "regular"
+) -> dict:
+    """
+    Games-weighted average league rate across a set of seasons, weighted
+    by games_by_season -- how many games THIS player/duo actually has in
+    each season (not the league's own game counts), same games-weighting
+    convention as span_percentiles, so a span leaning heavily on one
+    season isn't diluted by treating every season equally. A season
+    missing a given rate entirely (e.g. FG3_PCT before the 3-point line
+    existed) is skipped for that stat rather than pulling the average
+    toward zero.
+    """
+    result = {}
+    for stat in RELATIVE_SHOOTING_STATS:
+        weighted_sum, total_gp = 0.0, 0
+        for season, gp in games_by_season.items():
+            if not gp:
+                continue
+            rate = league_average_rates(store, season, season_type).get(stat)
+            if rate is None:
+                continue
+            weighted_sum += gp * rate
+            total_gp += gp
+        result[stat] = weighted_sum / total_gp if total_gp else None
+    return result
