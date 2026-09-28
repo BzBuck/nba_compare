@@ -18,6 +18,10 @@ class PlayerSpan:
     label: str | None = None    # display name, e.g. "LeBron (2015-2018)". Auto-generated if None.
     include_regular: bool = True
     include_playoffs: bool = True
+    # Head-to-head: when set, only games this player played AGAINST these
+    # player(s) count -- one player or a duo (see NBADataStore.games_head_to_head).
+    vs_player_ids: tuple[int, ...] = ()
+    vs_name: str | None = None
 
     def __post_init__(self):
         self.seasons = sorted(set(self.seasons))
@@ -29,6 +33,16 @@ class PlayerSpan:
                     f"{self.player_name} "
                     f"{_season_str(self.seasons[0])}\u2013{_season_str(self.seasons[-1])}"
                 )
+            if self.vs_name:
+                self.label += f" vs. {self.vs_name}"
+
+    @property
+    def player_ids(self) -> tuple[int, ...]:
+        return (self.player_id,)
+
+    @property
+    def names(self) -> str:
+        return self.player_name
 
     @classmethod
     def single_season(cls, player_id: int, player_name: str, season: int, **kwargs) -> "PlayerSpan":
@@ -63,17 +77,29 @@ class DuoSpan:
     label: str | None = None
     include_regular: bool = True
     include_playoffs: bool = True
+    # Head-to-head, same as PlayerSpan's: only games the duo played against these player(s).
+    vs_player_ids: tuple[int, ...] = ()
+    vs_name: str | None = None
 
     def __post_init__(self):
         self.seasons = sorted(set(self.seasons))
         if self.label is None:
-            names = f"{self.player_a_name} & {self.player_b_name}"
             if len(self.seasons) == 1:
-                self.label = f"{names} {_season_str(self.seasons[0])}"
+                self.label = f"{self.names} {_season_str(self.seasons[0])}"
             else:
                 self.label = (
-                    f"{names} {_season_str(self.seasons[0])}–{_season_str(self.seasons[-1])}"
+                    f"{self.names} {_season_str(self.seasons[0])}–{_season_str(self.seasons[-1])}"
                 )
+            if self.vs_name:
+                self.label += f" vs. {self.vs_name}"
+
+    @property
+    def player_ids(self) -> tuple[int, ...]:
+        return (self.player_a_id, self.player_b_id)
+
+    @property
+    def names(self) -> str:
+        return f"{self.player_a_name} & {self.player_b_name}"
 
 
 def _season_str(start_year: int) -> str:

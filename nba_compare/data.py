@@ -47,6 +47,11 @@ ROSTER_MINUTES_TOLERANCE = 5.0
 # TEAM_ID but don't represent meaningful shared floor time.
 DUO_MIN_MINUTES = 10.0
 
+# Same idea for head-to-head: both players must log at least this many
+# minutes, on OPPOSITE teams, for a game to count as them "playing against
+# each other" -- a 3-minute cameo before an ankle roll isn't a matchup.
+H2H_MIN_MINUTES = 10.0
+
 
 def _to_minutes(min_col: pd.Series) -> pd.Series:
     """Handle both plain numeric minutes and legacy 'MM:SS' string formats."""
@@ -365,6 +370,57 @@ class NBADataStore:
             merged[c] = merged[c] + merged[f"{c}_b"]
             merged = merged.drop(columns=[f"{c}_b"])
         return merged.reset_index(drop=True)
+
+    def head_to_head_game_ids(
+        self, side: list[int], opponents: list[int], seasons: list[int], season_type: str,
+        min_minutes: float = H2H_MIN_MINUTES,
+    ) -> set:
+        """
+        GAME_IDs within `seasons` where the two sides met: every player in
+        `side` on one team, every player in `opponents` on the other, and
+        ALL of them logging at least min_minutes (see H2H_MIN_MINUTES).
+        Each side is one player or a duo -- a duo only counts in a game
+        where both halves played, same rule as games_together(). Symmetric
+        in the two sides, so both columns of a head-to-head comparison are
+        built from the exact same games.
+        """
+        df = self._load(season_type)
+        ids = list(side) + list(opponents)
+        rows = df.loc[
+            df.SEASON.isin(seasons) & df.PLAYER_ID.isin(ids) & (df.MIN_NUM >= min_minutes),
+            ["GAME_ID", "PLAYER_ID", "TEAM_ID"],
+        ]
+        # One row per game, one column per player holding the team they
+        # played for; dropna keeps only games where everyone qualified.
+        teams = rows.pivot_table(index="GAME_ID", columns="PLAYER_ID", values="TEAM_ID", aggfunc="first")
+        teams = teams.reindex(columns=ids).dropna()
+        side_team = teams[list(side)]
+        opp_team = teams[list(opponents)]
+        met = (
+            (side_team.nunique(axis=1) == 1)
+            & (opp_team.nunique(axis=1) == 1)
+            & (side_team.iloc[:, 0] != opp_team.iloc[:, 0])
+        )
+        return set(teams.index[met])
+
+    def games_head_to_head(
+        self, side: list[int], opponents: list[int], seasons: list[int], season_type: str,
+        min_minutes: float = H2H_MIN_MINUTES,
+    ) -> pd.DataFrame:
+        """
+        `side`'s games (one player: games_with_team_context(); a duo:
+        games_together()) narrowed to the games against `opponents` (see
+        head_to_head_game_ids). Same columns as a normal span's games, so
+        it feeds _stat_block() and playoffs.compute_series_records()
+        unmodified -- and since WL is the side's team result in a game
+        against the opponents, W/L over these rows IS the head-to-head record.
+        """
+        if len(side) == 1:
+            games = self.games_with_team_context(side[0], seasons, season_type)
+        else:
+            games = self.games_together(side[0], side[1], seasons, season_type, min_minutes)
+        ids = self.head_to_head_game_ids(side, opponents, seasons, season_type, min_minutes)
+        return games[games["GAME_ID"].isin(ids)].reset_index(drop=True)
 
     def seasons_played(self, player_id: int, season_type: str = "regular") -> list[int]:
         df = self._load(season_type)

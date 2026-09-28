@@ -40,6 +40,7 @@ def serialize_config(
     accolade_path: str = "",
     duos: list[dict] | None = None,
     user_presets: list[dict] | None = None,
+    head_to_head: bool = False,
 ) -> str:
     """
     spans: list of {"player_id": int, "player_name": str, "seasons": [int,...],
@@ -50,6 +51,7 @@ def serialize_config(
     custom_formulas: list of {"label": str, "expr": str} plus optional
                      "fmt": str, "lower": bool, "managed": bool
     user_presets: list of {"name": str, "stats": [str,...], "formulas": [formula,...]}
+    head_to_head: whether head-to-head mode was on
     Returns a compact base64 string, safe to copy/paste or save to a file.
     """
     payload = {
@@ -60,6 +62,7 @@ def serialize_config(
         "custom_formulas": custom_formulas,
         "accolade_path": accolade_path,
         "user_presets": user_presets or [],
+        "head_to_head": head_to_head,
     }
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -68,7 +71,7 @@ def serialize_config(
 def deserialize_config(code: str) -> dict:
     """
     Returns {"spans": [...], "stat_order": [...], "custom_formulas": [...],
-    "accolade_path": str, "user_presets": [...], "config_version_found": int|None} with every field
+    "accolade_path": str, "user_presets": [...], "head_to_head": bool, "config_version_found": int|None} with every field
     type-checked and defaulted. Raises ConfigError (with a message safe to
     show the user) only if the code can't be read as a save at all --
     garbage input, corrupted base64/JSON. Never raises for a well-formed
@@ -170,6 +173,7 @@ def deserialize_config(code: str) -> dict:
         "custom_formulas": formulas,
         "accolade_path": accolade_path,
         "user_presets": user_presets,
+        "head_to_head": payload.get("head_to_head") is True,
         "config_version_found": payload.get("config_version"),
     }
 

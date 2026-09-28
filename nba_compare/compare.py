@@ -448,26 +448,49 @@ def _regular_season_seed(store: NBADataStore, games: pd.DataFrame) -> float | No
 
 
 def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
+    """
+    A head-to-head span (span.vs_player_ids set) is built from only the
+    games against that player, and differs in two ways:
+    - no "percentiles" -- those rank whole seasons against the league and
+      say nothing about these particular games, so they'd read as if they
+      were head-to-head numbers when they aren't.
+    - series records keep only the series actually played against the
+      opponent, with W/L from those games. The team's other series that
+      postseason would otherwise show up as "(DNP)" and count as series
+      missed to injury.
+    """
+    h2h = bool(span.vs_player_ids)
+
+    def games(season_type: str) -> pd.DataFrame:
+        if h2h:
+            return store.games_head_to_head(span.player_ids, span.vs_player_ids, span.seasons, season_type)
+        return store.games_with_team_context(span.player_id, span.seasons, season_type)
+
     result = {"span": span, "label": span.label, "regular": None, "playoffs": None}
     if span.include_regular:
-        reg_games = store.games_with_team_context(span.player_id, span.seasons, "regular")
+        reg_games = games("regular")
         result["regular"] = _stat_block(reg_games)
         if result["regular"] is not None:
-            result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
+            if not h2h:
+                result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
             result["regular"]["relative_shooting"] = _relative_shooting(
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
     if span.include_playoffs:
-        po_games = store.games_with_team_context(span.player_id, span.seasons, "playoffs")
+        po_games = games("playoffs")
         result["playoffs"] = _stat_block(po_games)
         if result["playoffs"] is not None:
-            result["playoffs"]["percentiles"] = _percentiles.span_percentiles(store, span, "playoffs")
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
-            raw_playoff_games = store.games(span.player_id, span.seasons, "playoffs")
-            records = _playoffs.compute_series_records(store, raw_playoff_games)
+            if h2h:
+                records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
+                records = [r for r in records if r["player_played"]]
+            else:
+                result["playoffs"]["percentiles"] = _percentiles.span_percentiles(store, span, "playoffs")
+                raw_playoff_games = store.games(span.player_id, span.seasons, "playoffs")
+                records = _playoffs.compute_series_records(store, raw_playoff_games)
             result["playoffs"]["series_records"] = records
             result["playoffs"]["depth"] = _playoffs.depth_summary(records)
     return result
@@ -482,10 +505,21 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
     concept and a duo's combined per-game value would trivially read near
     the 100th percentile, so it's omitted rather than shown misleadingly
     (table.py's getters already treat a missing percentiles key as "--").
+
+    A head-to-head duo (duo.vs_player_ids set) keeps only the games against
+    those player(s), and its series records only the series played against
+    them -- see aggregate_span for why.
     """
+    h2h = bool(duo.vs_player_ids)
+
+    def games(season_type: str) -> pd.DataFrame:
+        if h2h:
+            return store.games_head_to_head(duo.player_ids, duo.vs_player_ids, duo.seasons, season_type)
+        return store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, season_type)
+
     result = {"span": duo, "label": duo.label, "regular": None, "playoffs": None}
     if duo.include_regular:
-        reg_games = store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, "regular")
+        reg_games = games("regular")
         result["regular"] = _stat_block(reg_games)
         if result["regular"] is not None:
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
@@ -493,13 +527,15 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
     if duo.include_playoffs:
-        games = store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, "playoffs")
-        result["playoffs"] = _stat_block(games)
+        po_games = games("playoffs")
+        result["playoffs"] = _stat_block(po_games)
         if result["playoffs"] is not None:
             result["playoffs"]["relative_shooting"] = _relative_shooting(
-                store, games, result["playoffs"]["shooting"], "playoffs"
+                store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
-            records = _playoffs.compute_series_records(store, games, wl_from_player_games=True)
+            records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
+            if h2h:
+                records = [r for r in records if r["player_played"]]
             result["playoffs"]["series_records"] = records
             result["playoffs"]["depth"] = _playoffs.depth_summary(records)
     return result

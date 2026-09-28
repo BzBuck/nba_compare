@@ -8,6 +8,7 @@ Lets you add any number of player + year-range "spans" (including multiple
 spans of the same player), pick which stats show up, drag to reorder them,
 and define your own custom stat formulas from the existing ones.
 """
+import dataclasses
 import uuid
 import streamlit as st
 from streamlit_sortables import sort_items
@@ -179,6 +180,7 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             custom_formulas=st.session_state.get("custom_formulas", []),
             accolade_path=st.session_state.get("accolade_path_input", "") or "",
             user_presets=st.session_state.get("user_presets", []),
+            head_to_head=st.session_state.get("h2h_mode", False),
         )
         st.session_state["_last_save_code"] = code
     if st.session_state.get("_last_save_code"):
@@ -285,6 +287,7 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
 
             if cfg["accolade_path"]:
                 st.session_state["accolade_path_input"] = cfg["accolade_path"]
+            st.session_state["h2h_mode"] = cfg["head_to_head"]
 
             msg = f"Loaded {len(new_span_cfgs)} span(s)."
             if skipped_players:
@@ -541,6 +544,46 @@ for cfg in st.session_state.spans:
 
 st.button("+ Add player / span", on_click=add_span)
 
+head_to_head = st.toggle(
+    "Head-to-head", key="h2h_mode",
+    help="Only count games the two rows actually played against each other -- each row is a "
+         "player or a duo, and everyone involved needs 10+ minutes, with the two sides on "
+         "opposite teams. Needs exactly two rows.",
+)
+if head_to_head:
+    if len(valid_spans) != 2:
+        st.warning(
+            f"Head-to-head compares exactly two rows (players or duos) -- you have {len(valid_spans)}. "
+            "Showing the normal comparison instead."
+        )
+    elif set(valid_spans[0].player_ids) & set(valid_spans[1].player_ids):
+        st.warning(
+            "Head-to-head needs the two rows to share no players -- someone can't play against "
+            "themselves. Showing the normal comparison instead."
+        )
+    else:
+        a, b = valid_spans
+        # Both sides use the seasons BOTH ranges cover, so they're built from
+        # the exact same games -- otherwise one side could include meetings
+        # the other side's range leaves out.
+        shared = sorted(set(a.seasons) & set(b.seasons))
+        if not shared:
+            st.warning("Those two season ranges don't overlap -- no games to compare head-to-head.")
+            valid_spans = []
+        else:
+            def _is_auto_label(span) -> bool:
+                return span.label == dataclasses.replace(span, label=None).label
+
+            # A label typed in the row stays as typed; an auto one is rebuilt
+            # for the shared seasons and gains "vs. <opponent>".
+            valid_spans = [
+                dataclasses.replace(
+                    me, seasons=shared, label=None if _is_auto_label(me) else me.label,
+                    vs_player_ids=opp.player_ids, vs_name=opp.names,
+                )
+                for me, opp in ((a, b), (b, a))
+            ]
+
 if len(valid_spans) > 1:
     current_labels = [s.label for s in valid_spans]
     if len(current_labels) != len(set(current_labels)):
@@ -719,6 +762,16 @@ else:
             st.caption(
                 "CV% = game-to-game standard deviation \u00f7 mean, as a percent. Lower means more "
                 "predictable output game to game; it isn't a judgment of good or bad for a given role."
+            )
+        if head_to_head and all(s.vs_player_ids for s in valid_spans):
+            st.caption(
+                "**Head-to-head**: only games where every player in both rows logged 10+ minutes, "
+                "with the two rows on opposite teams, within the seasons both rows cover -- so both "
+                "columns come from the same games, and W/L is the head-to-head record. A duo's "
+                "column is the two players' combined numbers, as in Duo mode, and only counts games "
+                "where both of them played. %ile rows show — here, since they rank whole seasons "
+                "and don't describe these games. The playoff series breakdown lists only the "
+                "series they met in."
             )
         if any(lbl.endswith("%ile") for lbl in stat_labels):
             st.caption(
