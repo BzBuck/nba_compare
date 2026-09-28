@@ -1,6 +1,6 @@
 pandas
 pyarrow
 plotly
-streamlit
+streamlit>=1.40
 streamlit-sortables
 huggingface_hub

@@ -21,6 +21,10 @@ from nba_compare.table import (
 )
 from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_formula
 from nba_compare.session_config import serialize_config, deserialize_config, ConfigError
+from nba_compare.presets import (
+    BUILTIN_PRESETS, BUILTIN_PRESET_NAMES, DEFAULT_FORMULA_FMT,
+    apply_preset, matching_preset, preset_from_current,
+)
 from nba_compare.playoffs import (
     render_series_table_html, build_series_table, SERIES_COLUMN_DEFS, DEFAULT_SERIES_COLUMNS,
     round_labels_present, build_round_comparison_table,
@@ -76,6 +80,8 @@ if "series_col_order" not in st.session_state:
     st.session_state.series_col_order = list(DEFAULT_SERIES_COLUMNS)
 if "span_order" not in st.session_state:
     st.session_state.span_order = []
+if "user_presets" not in st.session_state:
+    st.session_state.user_presets = []  # list of {"name", "stats", "formulas"}
 
 
 def add_span():
@@ -172,6 +178,7 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             stat_order=st.session_state.get("stat_order", []),
             custom_formulas=st.session_state.get("custom_formulas", []),
             accolade_path=st.session_state.get("accolade_path_input", "") or "",
+            user_presets=st.session_state.get("user_presets", []),
         )
         st.session_state["_last_save_code"] = code
     if st.session_state.get("_last_save_code"):
@@ -253,6 +260,20 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
                     valid_formulas.append(f)
             st.session_state.custom_formulas = valid_formulas
 
+            # Saved presets get the same check on their formulas, and keep
+            # only the rows that still exist. A preset left with no rows, or
+            # one named like a built-in (which always wins), is dropped.
+            restored_presets, dropped_presets = [], []
+            for p in cfg["user_presets"]:
+                p_formulas = [f for f in p["formulas"] if not validate_formula(f["expr"], sample_vars)]
+                p_valid = set(STAT_DEFS) | {f["label"] for f in p_formulas}
+                p_stats = [x for x in p["stats"] if x in p_valid]
+                if not p_stats or p["name"] in BUILTIN_PRESET_NAMES:
+                    dropped_presets.append(p["name"])
+                    continue
+                restored_presets.append({**p, "stats": p_stats, "formulas": p_formulas})
+            st.session_state.user_presets = restored_presets
+
             # Stats: only keep labels that still exist (built-ins current
             # code defines + the custom formulas just restored) -- anything
             # else (a stat renamed/removed since the save) is dropped rather
@@ -272,6 +293,8 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
                 msg += f" Skipped duo(s) (a player not found in current data): {', '.join(skipped_duos)}."
             if dropped_formulas:
                 msg += f" Dropped invalid custom formula(s): {', '.join(dropped_formulas)}."
+            if dropped_presets:
+                msg += f" Dropped preset(s) (no stats left, or named like a built-in): {', '.join(dropped_presets)}."
             st.success(msg)
             st.rerun()
 
@@ -297,6 +320,9 @@ with st.sidebar.expander("Available variable names"):
 with st.sidebar.form("add_formula_form", clear_on_submit=True):
     new_label = st.text_input("Stat name", placeholder="Pts per Use")
     new_expr = st.text_input("Formula", placeholder="PTS/G / USG Vol/G")
+    fmt_cols = st.columns(2)
+    new_decimals = fmt_cols[0].selectbox("Decimals", [0, 1, 2, 3], index=3)
+    new_lower = fmt_cols[1].checkbox("Lower is better", help="Highlight the lowest value as best, like TOV/G.")
     submitted = st.form_submit_button("Add formula")
     if submitted:
         sample_vars = {v: 1.0 for v in STAT_DEFS}  # syntax/name check only
@@ -308,7 +334,10 @@ with st.sidebar.form("add_formula_form", clear_on_submit=True):
         elif error:
             st.sidebar.error(error)
         else:
-            st.session_state.custom_formulas.append({"label": new_label, "expr": new_expr})
+            st.session_state.custom_formulas.append({
+                "label": new_label, "expr": new_expr,
+                "fmt": f"{{:.{new_decimals}f}}", "lower": new_lower,
+            })
             st.session_state.stat_order.append(new_label)
             # Auto-show the new stat immediately, not just in stat_order --
             # the multiselect widget has its own persisted state (keyed by
@@ -317,13 +346,18 @@ with st.sidebar.form("add_formula_form", clear_on_submit=True):
             if "selected_stats" in st.session_state:
                 st.session_state.selected_stats = list(st.session_state.selected_stats) + [new_label]
 
-if st.session_state.custom_formulas:
-    st.sidebar.write("Your custom stats:")
-    for i, f in enumerate(st.session_state.custom_formulas):
-        cols = st.sidebar.columns([4, 1])
+
+def _formula_rows(container, formulas: list[dict], key_prefix: str):
+    """One caption + remove button per formula. Removal is by label, since
+    the user's and the preset's formulas are listed separately."""
+    for f in formulas:
+        cols = container.columns([4, 1])
         cols[0].caption(f"**{f['label']}** = `{f['expr']}`")
-        if cols[1].button("✕", key=f"del_formula_{i}"):
-            removed_label = st.session_state.custom_formulas.pop(i)["label"]
+        if cols[1].button("✕", key=f"{key_prefix}_{f['label']}"):
+            removed_label = f["label"]
+            st.session_state.custom_formulas = [
+                g for g in st.session_state.custom_formulas if g["label"] != removed_label
+            ]
             st.session_state.stat_order = [s for s in st.session_state.stat_order if s != removed_label]
             if "selected_stats" in st.session_state:
                 st.session_state.selected_stats = [
@@ -331,14 +365,25 @@ if st.session_state.custom_formulas:
                 ]
             st.rerun()
 
+
+own_formulas = [f for f in st.session_state.custom_formulas if not f.get("managed")]
+preset_formulas = [f for f in st.session_state.custom_formulas if f.get("managed")]
+if own_formulas:
+    st.sidebar.write("Your custom stats:")
+    _formula_rows(st.sidebar, own_formulas, "del_formula")
+if preset_formulas:
+    with st.sidebar.expander(f"Added by preset ({len(preset_formulas)})"):
+        st.caption("These come and go with the stat preset you pick.")
+        _formula_rows(st, preset_formulas, "del_preset_formula")
+
 # Combined registry: built-ins + custom formulas, each custom formula's
 # getter closing over its own expr (default val=expr avoids late-binding bugs).
 combined_stat_defs = dict(STAT_DEFS)
 for f in st.session_state.custom_formulas:
     combined_stat_defs[f["label"]] = (
         lambda block, expr=f["expr"]: safe_eval(expr, flatten_block_for_formula(block, STAT_DEFS)),
-        "{:.3f}",
-        False,
+        f.get("fmt", DEFAULT_FORMULA_FMT),
+        f.get("lower", False),
     )
 
 # ---------- span builder ----------
@@ -518,9 +563,59 @@ if len(valid_spans) > 1:
 
 st.divider()
 
+
+
+def _all_presets() -> list[dict]:
+    return BUILTIN_PRESETS + st.session_state.user_presets
+
+
+def _on_preset_pick():
+    name = st.session_state.get("preset_pick")
+    preset = next((p for p in _all_presets() if p["name"] == name), None)
+    if preset is None:
+        return  # clicking the active preset again just deselects it -- nothing to change
+    formulas, order = apply_preset(preset, st.session_state.custom_formulas)
+    st.session_state.custom_formulas = formulas
+    st.session_state.stat_order = order
+    st.session_state.selected_stats = list(order)
+
+
+def _save_user_preset():
+    name = st.session_state.get("new_preset_name", "").strip()
+    if not name:
+        st.session_state["_preset_msg"] = ("error", "Give the preset a name.")
+    elif name in BUILTIN_PRESET_NAMES:
+        st.session_state["_preset_msg"] = ("error", f"'{name}' is a built-in preset — pick a different name.")
+    elif not st.session_state.stat_order:
+        st.session_state["_preset_msg"] = ("error", "Pick some stats to save first.")
+    else:
+        preset = preset_from_current(name, st.session_state.stat_order, st.session_state.custom_formulas)
+        others = [p for p in st.session_state.user_presets if p["name"] != name]
+        replaced = len(others) != len(st.session_state.user_presets)
+        st.session_state.user_presets = others + [preset]
+        st.session_state.new_preset_name = ""
+        st.session_state["_preset_msg"] = ("success", f"{'Updated' if replaced else 'Saved'} preset '{name}'.")
+
+
+def _delete_user_preset(name: str):
+    st.session_state.user_presets = [p for p in st.session_state.user_presets if p["name"] != name]
+
+
 if len(valid_spans) == 0:
     st.info("Add at least one player above to see a comparison.")
 else:
+    # Reflect which preset (if any) the current rows match, so the pill
+    # shows as active until the stats are edited by hand. Set before the
+    # widget renders, which is the only point Streamlit allows it.
+    presets = _all_presets()
+    st.session_state.preset_pick = matching_preset(st.session_state.stat_order, presets)
+    st.pills(
+        "Stat presets", [p["name"] for p in presets], selection_mode="single",
+        key="preset_pick", on_change=_on_preset_pick,
+        help="Swap the table to a themed set of stats. Presets add the custom formulas they "
+             "need and remove them again when you switch; your own formulas are never touched.",
+    )
+
     with st.expander("Customize stats shown", expanded=False):
         available_labels = list(combined_stat_defs.keys())
 
@@ -557,6 +652,23 @@ else:
                 st.session_state.stat_order = ordered_selection
         stat_labels = st.session_state.stat_order
 
+        st.divider()
+        preset_cols = st.columns([3, 1])
+        preset_cols[0].text_input(
+            "Save these stats as a preset", key="new_preset_name", placeholder="Preset name",
+            help="Saves the stats above, in this order, plus any custom formulas they use. "
+                 "Saving under an existing name updates it. Presets are kept in your save code.",
+        )
+        preset_cols[1].button("Save preset", on_click=_save_user_preset, use_container_width=True)
+        msg = st.session_state.pop("_preset_msg", None)
+        if msg:
+            (st.error if msg[0] == "error" else st.success)(msg[1])
+        for p in st.session_state.user_presets:
+            cols = st.columns([4, 1])
+            cols[0].caption(f"**{p['name']}** — {len(p['stats'])} stats")
+            cols[1].button("✕", key=f"del_user_preset_{p['name']}",
+                           on_click=_delete_user_preset, args=(p["name"],))
+
     result = compare_spans(valid_spans, store)
     has_regular = any(agg["regular"] for agg in result.aggregates)
     has_playoffs = any(agg["playoffs"] for agg in result.aggregates)
@@ -589,6 +701,19 @@ else:
                 "/36, which can't tell a 100-possession game from an 85-possession one. Possessions "
                 "come out of the team box score, so these rows are blank for seasons before 1977: "
                 "turnovers weren't recorded, and without them there's no possession estimate to make."
+            )
+        if any(lbl.endswith("/75") for lbl in stat_labels):
+            st.caption(
+                "**/75** = the /100 rate scaled to 75 possessions — the same pace adjustment, "
+                "at roughly a starter's per-game possession count, which is the usual baseline "
+                "for comparing players across eras."
+            )
+        if any(lbl.startswith(("Team ", "Opp ")) and lbl.endswith("/G") and lbl not in ("Team Poss/G",)
+               for lbl in stat_labels):
+            st.caption(
+                "**Team/Opp …/G** = the player's team's and its opponents' box score, per game, over "
+                "the games in this span. Each is averaged over the games that have it recorded; "
+                "before 1985 most columns are rebuilt from player logs where possible (marked *)."
             )
         if any(lbl.endswith("CV%") for lbl in stat_labels):
             st.caption(

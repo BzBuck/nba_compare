@@ -8,6 +8,7 @@ Kept separate from viz.py since this renders as HTML/dataframe, not Plotly.
 from __future__ import annotations
 import pandas as pd
 from .compare import ComparisonResult
+from .data import TEAM_BOX_STATS
 from .models import DuoSpan
 
 # label -> (getter(stat_block) -> value, display format, lower_is_better)
@@ -65,7 +66,6 @@ STAT_DEFS = {
     "MIN%":       (lambda b: (b["usage"] or {}).get("min_pct"),         "{:.1f}", False),
     "USG%":       (lambda b: (b["usage"] or {}).get("usg_pct"),         "{:.1f}", False),
     "USG Vol/G":  (lambda b: (b["usage"] or {}).get("usage_per_game"),  "{:.1f}", False),
-    "Team PTS/G": (lambda b: (b["team"] or {}).get("team_pts_per_game"),   "{:.1f}", False),
     "Team Poss/G": (lambda b: (b["team"] or {}).get("team_poss_per_game"), "{:.1f}", False),
     "Team Pace":  (lambda b: (b["team"] or {}).get("team_pace"),        "{:.1f}", False),
     "Team ORtg":  (lambda b: (b["team"] or {}).get("team_ortg"),        "{:.1f}", False),
@@ -115,6 +115,30 @@ STAT_DEFS = {
     "eFG% %ile":  (lambda b: (b.get("percentiles") or {}).get("EFG_PCT"),           "{:.0f}", False),
     "TS% %ile":   (lambda b: (b.get("percentiles") or {}).get("TS_PCT"),            "{:.0f}", False),
 }
+# The team's and opponent's full box score per game (compare._compute_team_box),
+# labeled the same way as the player's own rows -- "Team AST/G" next to
+# "AST/G" -- so a formula like AST% reads the way it's written on
+# Basketball-Reference. Generated rather than listed out: it's the same
+# getter 30 times over. Lower-is-better follows the team's point of view:
+# its own turnovers and fouls are bad, and every opponent number is bad
+# except the opponent's turnovers and fouls.
+_BOX_LABELS = {
+    "PTS": "PTS", "REB": "TRB", "OREB": "ORB", "DREB": "DRB", "AST": "AST", "STL": "STL",
+    "BLK": "BLK", "TOV": "TOV", "PF": "PF", "FGM": "FGM", "FGA": "FGA", "FG3M": "3PM",
+    "FG3A": "3PA", "FTM": "FTM", "FTA": "FTA",
+}
+_TEAM_BOX_KEYS = {"Team MIN/G": "TEAM_MIN"}
+for _prefix, _name in (("TEAM", "Team"), ("OPP", "Opp")):
+    for _stat in TEAM_BOX_STATS:
+        _TEAM_BOX_KEYS[f"{_name} {_BOX_LABELS[_stat]}/G"] = f"{_prefix}_{_stat}"
+for _label, _key in _TEAM_BOX_KEYS.items():
+    _bad_for_team = (_key.endswith(("_TOV", "_PF")) if _key.startswith("TEAM_")
+                     else not _key.endswith(("_TOV", "_PF")))
+    STAT_DEFS[_label] = (
+        lambda b, key=_key: (b.get("team_box") or {}).get(key),
+        "{:.1f}", _bad_for_team,
+    )
+
 # Shown by default; advanced/team/consistency rows are opt-in since they
 # answer a different question than raw production and would clutter the
 # default view.
@@ -132,7 +156,7 @@ LOWER_IS_BETTER = {label for label, (_getter, _fmt, lower) in STAT_DEFS.items() 
 ESTIMATED_MARK = "*"
 ESTIMATED_NOTE = (
     "* Built from team box-score lines rebuilt by summing each game's individual "
-    "player rows \u2014 the official team logs carry no FGA/FTA/TOV/OREB before 1985. "
+    "player rows \u2014 the official team logs are missing most box-score columns before 1985. "
     "Covers only part of each 1977\u20131984 season, and misses team turnovers that "
     "aren't charged to a player, so treat these as close estimates rather than "
     "settled numbers. Earlier seasons show \u2014: with no turnovers recorded there is "
@@ -153,7 +177,7 @@ ESTIMATED_SOURCES = {
     "MIN%": "usage",
     "USG%": "usage",
     "USG Vol/G": "usage",
-    "Team PTS/G": "team",
+    **{label: ("team_box", key) for label, key in _TEAM_BOX_KEYS.items()},
     "Team Poss/G": "team",
     "Team Pace": "team",
     "Team ORtg": "team",
@@ -163,10 +187,15 @@ ESTIMATED_SOURCES = {
 
 
 def _is_estimated(block: dict | None, label: str) -> bool:
-    """Whether this span's value for this row should carry ESTIMATED_MARK."""
+    """Whether this span's value for this row should carry ESTIMATED_MARK.
+    A (source, key) entry reads a per-column flag -- the team_box block
+    tracks "estimated" separately for each of its columns."""
     source = ESTIMATED_SOURCES.get(label)
     if block is None or source is None:
         return False
+    if isinstance(source, tuple):
+        source, key = source
+        return bool(((block.get(source) or {}).get("estimated") or {}).get(key))
     return bool((block.get(source) or {}).get("estimated"))
 
 

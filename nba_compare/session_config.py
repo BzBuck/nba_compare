@@ -1,6 +1,6 @@
 """
 Save/restore the current comparison setup (players, seasons, chosen stats,
-custom formulas) as a compact, versioned string -- designed so a saved
+custom formulas, saved stat presets) as a compact, versioned string -- designed so a saved
 setup keeps working even after the app's code has changed.
 
 Why this survives code iterations, specifically:
@@ -23,7 +23,10 @@ from __future__ import annotations
 import base64
 import json
 
-CONFIG_VERSION = 1
+# 2: custom formulas can carry "fmt"/"lower"/"managed", and saves carry
+#    "user_presets". Version-1 saves load unchanged -- every new field is
+#    optional.
+CONFIG_VERSION = 2
 
 
 class ConfigError(ValueError):
@@ -36,6 +39,7 @@ def serialize_config(
     custom_formulas: list[dict],
     accolade_path: str = "",
     duos: list[dict] | None = None,
+    user_presets: list[dict] | None = None,
 ) -> str:
     """
     spans: list of {"player_id": int, "player_name": str, "seasons": [int,...],
@@ -43,6 +47,9 @@ def serialize_config(
     duos: list of {"player_a_id": int, "player_a_name": str, "player_b_id": int,
                     "player_b_name": str, "seasons": [int,...], "label": str|None,
                     "include_regular": bool, "include_playoffs": bool}
+    custom_formulas: list of {"label": str, "expr": str} plus optional
+                     "fmt": str, "lower": bool, "managed": bool
+    user_presets: list of {"name": str, "stats": [str,...], "formulas": [formula,...]}
     Returns a compact base64 string, safe to copy/paste or save to a file.
     """
     payload = {
@@ -52,6 +59,7 @@ def serialize_config(
         "stat_order": stat_order,
         "custom_formulas": custom_formulas,
         "accolade_path": accolade_path,
+        "user_presets": user_presets or [],
     }
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -60,7 +68,7 @@ def serialize_config(
 def deserialize_config(code: str) -> dict:
     """
     Returns {"spans": [...], "stat_order": [...], "custom_formulas": [...],
-    "accolade_path": str, "config_version_found": int|None} with every field
+    "accolade_path": str, "user_presets": [...], "config_version_found": int|None} with every field
     type-checked and defaulted. Raises ConfigError (with a message safe to
     show the user) only if the code can't be read as a save at all --
     garbage input, corrupted base64/JSON. Never raises for a well-formed
@@ -130,12 +138,26 @@ def deserialize_config(code: str) -> dict:
     stat_order = payload.get("stat_order", [])
     stat_order = [s for s in stat_order if isinstance(s, str)] if isinstance(stat_order, list) else []
 
-    formulas_raw = payload.get("custom_formulas", [])
-    formulas = []
-    if isinstance(formulas_raw, list):
-        for f in formulas_raw:
-            if isinstance(f, dict) and isinstance(f.get("label"), str) and isinstance(f.get("expr"), str):
-                formulas.append({"label": f["label"], "expr": f["expr"]})
+    formulas = _read_formulas(payload.get("custom_formulas", []))
+
+    presets_raw = payload.get("user_presets", [])
+    user_presets = []
+    if isinstance(presets_raw, list):
+        for p in presets_raw:
+            if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"].strip():
+                continue
+            stats = p.get("stats", [])
+            stats = [x for x in stats if isinstance(x, str)] if isinstance(stats, list) else []
+            if not stats:
+                continue
+            user_presets.append({
+                "name": p["name"],
+                "stats": stats,
+                "formulas": [
+                    {k: v for k, v in f.items() if k != "managed"}
+                    for f in _read_formulas(p.get("formulas", []))
+                ],
+            })
 
     accolade_path = payload.get("accolade_path", "")
     if not isinstance(accolade_path, str):
@@ -147,5 +169,32 @@ def deserialize_config(code: str) -> dict:
         "stat_order": stat_order,
         "custom_formulas": formulas,
         "accolade_path": accolade_path,
+        "user_presets": user_presets,
         "config_version_found": payload.get("config_version"),
     }
+
+
+def _read_formulas(raw) -> list[dict]:
+    """Formula dicts from a save, keeping the optional "fmt"/"lower"/
+    "managed" fields only when they're the right type -- and "fmt" only
+    when it can actually format a number, so a mangled one falls back to
+    the default display instead of breaking the table."""
+    formulas = []
+    if not isinstance(raw, list):
+        return formulas
+    for f in raw:
+        if not (isinstance(f, dict) and isinstance(f.get("label"), str) and isinstance(f.get("expr"), str)):
+            continue
+        entry = {"label": f["label"], "expr": f["expr"]}
+        fmt = f.get("fmt")
+        if isinstance(fmt, str):
+            try:
+                fmt.format(1.0)
+                entry["fmt"] = fmt
+            except (ValueError, IndexError, KeyError):
+                pass
+        for flag in ("lower", "managed"):
+            if isinstance(f.get(flag), bool):
+                entry[flag] = f[flag]
+        formulas.append(entry)
+    return formulas

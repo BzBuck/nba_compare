@@ -27,7 +27,14 @@ COUNTING_STATS = [
 # Team box-score columns every possession-based number is built from
 # (pace, ORtg/DRtg, USG%, and all the per-100 stats). The team parquet only
 # carries these in full from 1985 onward -- see _reconstructed_team_lines.
+# A rebuilt value in one of THESE is what sets TEAM_EST.
 TEAM_POSSESSION_STATS = ["FGA", "FTA", "TOV", "OREB", "PTS"]
+
+# Every team/opponent box-score column joined onto a player's games (as
+# TEAM_<stat> / OPP_<stat>) -- the possession columns above plus the rest of
+# the line (FGM, REB, AST, BLK, ...), which feed the Team/Opp rows and
+# formulas like AST% or TRB%. Same gaps before 1985, same rebuild.
+TEAM_BOX_STATS = COUNTING_STATS
 
 # How far a game's summed player minutes may sit from the official team
 # minutes before the player rows are treated as an incomplete roster and
@@ -73,7 +80,7 @@ def _fill_missing_team_stats(
     merged: pd.DataFrame, recon: pd.DataFrame, prefix: str, id_col: str
 ) -> pd.DataFrame:
     """
-    Fill NaN <prefix>_FGA/FTA/TOV/OREB/PTS columns from `recon` (team lines
+    Fill NaN <prefix>_<stat> columns (every TEAM_BOX_STATS stat) from `recon` (team lines
     rebuilt by summing player rows -- see
     NBADataStore._reconstructed_team_lines), matched on GAME_ID + id_col.
     Official values are never overwritten; this only fills gaps.
@@ -87,8 +94,12 @@ def _fill_missing_team_stats(
     missing or zero (some 1960s rows) get no fill at all.
 
     Accumulates a boolean TEAM_EST column marking rows where at least one
-    value came from a rebuilt line rather than the official team logs --
-    that's what the comparison table marks with an asterisk.
+    POSSESSION value (TEAM_POSSESSION_STATS) came from a rebuilt line rather
+    than the official team logs -- that's what the comparison table marks
+    with an asterisk on the possession-based rows. Each stat also gets its
+    own <prefix>_<stat>_EST column, so a Team/Opp row is only marked when
+    its own column was rebuilt, and a filled AST can't mark USG% (or the
+    reverse).
     """
     if merged.empty or id_col not in merged.columns:
         return merged
@@ -99,7 +110,7 @@ def _fill_missing_team_stats(
     # the key go to float64. Team IDs are ~1.6e9, exactly representable.
     key = "_join_team_id"
     left = merged.assign(**{key: merged[id_col].astype("float64")})
-    src_cols = TEAM_POSSESSION_STATS + ["MIN_NUM"]
+    src_cols = TEAM_BOX_STATS + ["MIN_NUM"]
     right = recon.assign(**{key: recon["TEAM_ID"].astype("float64")})
     right = right[["GAME_ID", key] + src_cols].rename(
         columns={c: f"_recon_{c}" for c in src_cols}
@@ -112,12 +123,14 @@ def _fill_missing_team_stats(
     ) & (official_min > 0)
 
     estimated = pd.Series(False, index=out.index)
-    for stat in TEAM_POSSESSION_STATS:
+    for stat in TEAM_BOX_STATS:
         target = f"{prefix}_{stat}"
         available = out[f"_recon_{stat}"].where(roster_complete)
         gap = out[target].isna() & available.notna()
         out.loc[gap, target] = available[gap]
-        estimated |= gap
+        out[f"{target}_EST"] = gap
+        if stat in TEAM_POSSESSION_STATS:
+            estimated |= gap
 
     prior = out["TEAM_EST"] if "TEAM_EST" in out.columns else False
     out["TEAM_EST"] = estimated | prior
@@ -202,7 +215,7 @@ class NBADataStore:
         cache_key = f"recon_{season_type}"
         if cache_key not in self._cache:
             df = self._load(season_type)
-            cols = TEAM_POSSESSION_STATS + ["MIN_NUM"]
+            cols = TEAM_BOX_STATS + ["MIN_NUM"]
             group_keys = [df["GAME_ID"], df["TEAM_ID"]]
             sums = df[cols].groupby(group_keys).sum(min_count=1)
             null_counts = df[cols].isna().groupby(group_keys).sum()
@@ -230,44 +243,39 @@ class NBADataStore:
     def games_with_team_context(self, player_id: int, seasons: list[int], season_type: str) -> pd.DataFrame:
         """
         Same as games(), but left-joins each row with:
-        - that game's TEAM totals (TEAM_MIN, TEAM_FGA, TEAM_FTA, TEAM_TOV,
-          TEAM_PTS, TEAM_OREB), matched on GAME_ID + TEAM_ID -- for usage%
-          and team pace/scoring context.
-        - that game's OPPONENT totals (OPP_PTS, OPP_FGA, OPP_FTA, OPP_TOV,
-          OPP_OREB), matched on GAME_ID with a different TEAM_ID -- for
-          team defensive rating (points allowed per 100 opponent possessions).
+        - that game's full TEAM box line (TEAM_MIN plus TEAM_<stat> for every
+          TEAM_BOX_STATS stat), matched on GAME_ID + TEAM_ID -- for usage%,
+          team pace/scoring context, and the Team rows/formula variables.
+        - that game's full OPPONENT box line (OPP_MIN, OPP_<stat>), matched
+          on GAME_ID with a different TEAM_ID -- for team defensive rating
+          (points allowed per 100 opponent possessions) and the Opp rows.
 
         Rows where no match is found get NaN in the relevant columns --
         callers should filter those out before computing with them.
 
         Because the team parquet has no possession columns at all before
-        1985, any gap left in TEAM_*/OPP_* FGA/FTA/TOV/OREB/PTS is then
+        1985, any gap left in a TEAM_*/OPP_* box column is then
         filled where possible from team lines rebuilt out of the player
         logs (see _reconstructed_team_lines), and the boolean TEAM_EST
-        column marks the rows where that happened, so downstream stats can
-        be flagged as estimates rather than passed off as officially
-        sourced.
+        column marks the rows where that happened for a possession column
+        (per-column <prefix>_<stat>_EST flags cover the rest), so downstream
+        stats can be flagged as estimates rather than passed off as
+        officially sourced.
         """
         player_df = self.games(player_id, seasons, season_type)
         team_key = "team_regular" if season_type == "regular" else "team_playoffs"
         team_df = self._load(team_key)
 
-        team_slim = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM", "FGA", "FTA", "TOV", "PTS", "OREB"]].rename(
-            columns={
-                "MIN_NUM": "TEAM_MIN", "FGA": "TEAM_FGA", "FTA": "TEAM_FTA", "TOV": "TEAM_TOV",
-                "PTS": "TEAM_PTS", "OREB": "TEAM_OREB",
-            }
+        team_slim = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM"] + TEAM_BOX_STATS].rename(
+            columns={"MIN_NUM": "TEAM_MIN", **{c: f"TEAM_{c}" for c in TEAM_BOX_STATS}}
         )
         merged = player_df.merge(team_slim, on=["GAME_ID", "TEAM_ID"], how="left")
 
         # OPP_MIN isn't used in any stat directly -- it's the completeness
         # check that lets a rebuilt OPPONENT line be trusted, the same way
         # TEAM_MIN does for the player's own team.
-        opp_slim = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM", "PTS", "FGA", "FTA", "TOV", "OREB"]].rename(
-            columns={
-                "TEAM_ID": "OPP_TEAM_ID", "MIN_NUM": "OPP_MIN", "PTS": "OPP_PTS", "FGA": "OPP_FGA",
-                "FTA": "OPP_FTA", "TOV": "OPP_TOV", "OREB": "OPP_OREB",
-            }
+        opp_slim = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM"] + TEAM_BOX_STATS].rename(
+            columns={"TEAM_ID": "OPP_TEAM_ID", "MIN_NUM": "OPP_MIN", **{c: f"OPP_{c}" for c in TEAM_BOX_STATS}}
         )
         # Join on GAME_ID only (opponent has a different TEAM_ID by definition),
         # then keep just the row where the matched team ISN'T the player's own

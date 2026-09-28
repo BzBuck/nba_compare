@@ -4,7 +4,7 @@ N-way comparisons across spans (players, years, or mixed).
 """
 from __future__ import annotations
 import pandas as pd
-from .data import NBADataStore, COUNTING_STATS
+from .data import NBADataStore, COUNTING_STATS, TEAM_BOX_STATS
 from .models import PlayerSpan, DuoSpan
 from . import playoffs as _playoffs
 from . import percentiles as _percentiles
@@ -13,6 +13,9 @@ from . import percentiles as _percentiles
 # as a rough "consistency" read: how much a player's game-to-game output swings.
 # Kept in sync with table.STAT_DEFS's *_CV%/*_Floor rows -- add a stat in both places.
 CONSISTENCY_STATS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "FGM", "FTM"]
+
+# 1979-80, the first season with a 3-point line (SEASON is the start year).
+FIRST_THREE_POINT_SEASON = 1979
 
 
 def _any_estimated(rows: pd.DataFrame) -> bool:
@@ -238,6 +241,48 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
     return result
 
 
+def _compute_team_box(games_with_team: pd.DataFrame) -> dict | None:
+    """
+    The team's and the opponent's full box score, per game, over the games
+    in this span: {"TEAM_MIN": ..., "TEAM_FGM": ..., "OPP_REB": ..., ...}.
+    Raw material for the Team/Opp rows and for formulas like AST% or TRB%
+    that need the whole floor's numbers, not just the player's.
+
+    Each column is averaged over the games that actually have it, not the
+    whole span -- a 1983 span keeps its official team PTS for every game
+    even where the rebuilt FGM covers only some of them. "estimated" is
+    per column for the same reason: a column is marked only if a rebuilt
+    value went into THAT column's average.
+    """
+    if "TEAM_MIN" not in games_with_team.columns:
+        return None
+    # No 3-point line before 1979-80: those logs leave 3PM/3PA blank, but the
+    # true count is zero -- and a blank Opp 3PA would wipe out BLK% (which
+    # needs opponent 2-point tries) for the 1973-79 seasons that DO have
+    # blocks. Player 3PM/3PA already come out as 0 there, since they're sums.
+    if "SEASON" in games_with_team.columns:
+        pre_three = games_with_team["SEASON"] < FIRST_THREE_POINT_SEASON
+        if pre_three.any():
+            games_with_team = games_with_team.copy()
+            for col in ("TEAM_FG3M", "TEAM_FG3A", "OPP_FG3M", "OPP_FG3A"):
+                games_with_team.loc[pre_three, col] = games_with_team.loc[pre_three, col].fillna(0)
+    result, estimated = {}, {}
+    for col in ["TEAM_MIN"] + [f"{p}_{c}" for p in ("TEAM", "OPP") for c in TEAM_BOX_STATS]:
+        vals = games_with_team[col].dropna()
+        if col == "TEAM_MIN":
+            # Much of the 1960s logs record team minutes as 0 -- missing,
+            # not a real value, and averaging it in would sink the mean.
+            vals = vals[vals > 0]
+        result[col] = vals.mean() if not vals.empty else None
+        est_col = f"{col}_EST"
+        estimated[col] = (
+            bool(games_with_team.loc[vals.index, est_col].fillna(False).astype(bool).any())
+            if est_col in games_with_team.columns and not vals.empty else False
+        )
+    result["estimated"] = estimated
+    return result
+
+
 def _stat_with_floor(vals: pd.Series, floor_q: float = 0.10) -> dict:
     """
     mean/std/cv_pct plus a "floor" = the floor_q percentile of the game log
@@ -326,6 +371,7 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
     usage = _compute_usage(games) if "TEAM_MIN" in games.columns else None
     team = _compute_team_context(games) if "TEAM_PTS" in games.columns else None
     possessions = _compute_per_100(games) if "TEAM_MIN" in games.columns else None
+    team_box = _compute_team_box(games)
 
     return {
         "games": gp,
@@ -345,6 +391,7 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
         "tsa_per_game": tsa_per_game,
         "usage": usage,
         "team": team,
+        "team_box": team_box,
         "consistency": _compute_consistency(games),
         "plus_minus_per_game": games["PLUS_MINUS"].mean() if "PLUS_MINUS" in games.columns else None,
         "plus_minus_std": plus_minus_std,

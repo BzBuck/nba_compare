@@ -17,6 +17,7 @@ walker doesn't recognize and rejects, not something it executes.
 """
 from __future__ import annotations
 import ast
+import math
 import operator
 import re
 
@@ -50,10 +51,16 @@ def _eval_node(node, variables: dict):
         right = _eval_node(node.right, variables)
         if left is None or right is None:
             return None
+        # Stat values often arrive as numpy scalars, whose division by zero
+        # quietly returns inf/nan instead of raising -- coerce to plain
+        # floats so x/0 is blank the same way whatever the value's type.
         try:
-            return _ALLOWED_BINOPS[type(node.op)](left, right)
-        except ZeroDivisionError:
+            result = _ALLOWED_BINOPS[type(node.op)](float(left), float(right))
+        except (ZeroDivisionError, OverflowError):
             return None
+        if isinstance(result, complex) or not math.isfinite(result):
+            return None
+        return result
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARY:
         val = _eval_node(node.operand, variables)
         return None if val is None else _ALLOWED_UNARY[type(node.op)](val)
