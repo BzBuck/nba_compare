@@ -177,7 +177,7 @@ def _empty_series_stat_block() -> dict:
     """Placeholder stats for a series the player didn't appear in at all
     (missed to injury) -- GP=0, everything else None/0 rather than
     omitted, so SERIES_COLUMN_DEFS getters don't need special-casing."""
-    stat_cols = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
+    stat_cols = ["PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
     return {
         "gp": 0,
         "per_game": {c: None for c in stat_cols},
@@ -224,7 +224,7 @@ def _series_stat_block(g: pd.DataFrame) -> dict:
     _stat_block, but series-scoped and without team/usage context (not
     meaningful at single-series granularity)."""
     gp = len(g)
-    stat_cols = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
+    stat_cols = ["PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
     totals = {c: g[c].sum() for c in stat_cols if c in g.columns}
     per_game = {c: (totals[c] / gp if gp else None) for c in totals}
     fga, fgm, fg3m, fta, ftm = (totals.get(k, 0) for k in ("FGA", "FGM", "FG3M", "FTA", "FTM"))
@@ -333,11 +333,19 @@ SERIES_COLUMN_DEFS = {
     "L":             (lambda r: r["l"],                                "{:.0f}", True),
     "PTS/G":         (lambda r: r["stats"]["per_game"].get("PTS"),      "{:.1f}", False),
     "TRB/G":         (lambda r: r["stats"]["per_game"].get("REB"),      "{:.1f}", False),
+    "ORB/G":         (lambda r: r["stats"]["per_game"].get("OREB"),     "{:.1f}", False),
+    "DRB/G":         (lambda r: r["stats"]["per_game"].get("DREB"),     "{:.1f}", False),
     "AST/G":         (lambda r: r["stats"]["per_game"].get("AST"),      "{:.1f}", False),
     "STL/G":         (lambda r: r["stats"]["per_game"].get("STL"),      "{:.1f}", False),
     "BLK/G":         (lambda r: r["stats"]["per_game"].get("BLK"),      "{:.1f}", False),
     "TOV/G":         (lambda r: r["stats"]["per_game"].get("TOV"),      "{:.1f}", True),
     "PF/G":          (lambda r: r["stats"]["per_game"].get("PF"),       "{:.1f}", True),
+    "FGM/G":         (lambda r: r["stats"]["per_game"].get("FGM"),       "{:.1f}", False),
+    "FGA/G":         (lambda r: r["stats"]["per_game"].get("FGA"),       "{:.1f}", False),
+    "3PM/G":         (lambda r: r["stats"]["per_game"].get("FG3M"),      "{:.1f}", False),
+    "3PA/G":         (lambda r: r["stats"]["per_game"].get("FG3A"),      "{:.1f}", False),
+    "FTM/G":         (lambda r: r["stats"]["per_game"].get("FTM"),       "{:.1f}", False),
+    "FTA/G":         (lambda r: r["stats"]["per_game"].get("FTA"),       "{:.1f}", False),
     "FG%":           (lambda r: r["stats"]["shooting"]["FG_PCT"],       "{:.3f}", False),
     "3P%":           (lambda r: r["stats"]["shooting"]["FG3_PCT"],      "{:.3f}", False),
     "FT%":           (lambda r: r["stats"]["shooting"]["FT_PCT"],       "{:.3f}", False),

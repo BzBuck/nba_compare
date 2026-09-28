@@ -32,19 +32,27 @@ streamlit run app.py
   comparisons, series listing) — requires giving spans with the same
   default name distinct labels first, since dragging can't tell apart two
   identically-named columns.
+- **Duo mode**: each row can be a single **Player** or a **Duo** — two
+  teammates compared as their *combined* numbers for the games they
+  actually shared on the floor together, not their individual careers
+  added up. A game only counts if both players logged real minutes in it
+  (see "Duo mode" below for exactly what that means and how it interacts
+  with usage%, playoff series records, and awards).
 - **Season range slider** per span (single season, a few years, or full
   career), plus independent toggles for regular season / playoffs.
 - **Customize stats shown**: pick exactly which stats appear from the full
   catalog below (box score, usage, team context, consistency, your own
   custom formulas), then **drag to reorder** them.
 - **Custom stat formulas**: sidebar form to define your own stat as a
-  formula over existing ones — e.g. `PTS / USG_VOL_G` for points per used
-  possession. See "Custom formulas" below for the full variable list and
-  what's actually allowed in an expression.
-- **Save / Load setup**: sidebar section to save your current players,
-  seasons, and stat selection as a code (or file) you can paste back in
-  later, in a different session, after the app's code has changed. See
-  "Save / Load" below for why this is safe against future edits.
+  formula over existing ones, using the exact stat labels shown in the
+  table — e.g. `PTS/G / USG Vol/G` for points per used possession. See
+  "Custom formulas" below for the full variable list and what's actually
+  allowed in an expression.
+- **Save / Load setup**: sidebar section to save your current players
+  and duos, seasons, and stat selection as a code (or file) you can paste
+  back in later, in a different session, after the app's code has
+  changed. See "Save / Load" below for why this is safe against future
+  edits.
 - **Playoff series breakdown**: expander below the tables with two views —
   **Round-by-round comparison** (rows=stats, columns=spans, best value
   highlighted — same visual style as the main box score table, one
@@ -57,8 +65,11 @@ streamlit run app.py
   & series" below.
 
 Results render as a Stathead-style table — one row per stat, one column
-per span, best value in each row highlighted — split into separate
-Regular Season and Playoffs tables. An Awards & Honors table appears too,
+per span, best value in each row highlighted green and (with 3+ columns
+being compared) worst highlighted red — split into separate Regular
+Season and Playoffs tables. With exactly 2 columns, worst is never
+highlighted, since it'd just be "not green" shown louder; ties at either
+extreme aren't highlighted either. An Awards & Honors table appears too,
 if you point the sidebar at an accolades CSV (see `accolades.py`).
 
 ## Quick test (no UI)
@@ -109,20 +120,33 @@ from the project root, without needing anything in the shared `Code/` folder.
 
 Everything below lives in `table.STAT_DEFS`, one dict entry per row, so
 adding/renaming a stat is a one-line change in `table.py`. All are
-toggleable/reorderable in the app; the ★ ones are on by default.
+toggleable/reorderable in the app; the • ones are on by default. (A • means
+something else entirely and never appears here — in the rendered table it
+marks a value built from rebuilt team data; see "Per 100 possessions" below.)
 
-**Box score** — ★GP, ★W, ★L, ★MIN/G, ★PTS/G, ★TRB/G, ★AST/G, ★STL/G,
-★BLK/G, ★TOV/G, ★PF/G, ★+/-
+**Box score** — •GP, •W, •L, •MIN/G, •PTS/G, •TRB/G, ORB/G, DRB/G, •AST/G, •STL/G,
+•BLK/G, •TOV/G, •PF/G, •+/-
 
-**Shooting** — ★FG%, ★3P%, ★FT%, ★eFG%, ★TS%, ★TSA/G (true shot attempts =
-FGA + .44·FTA, i.e. usage without the turnovers)
+**Shooting** — FGM/G, FGA/G, 3PM/G, 3PA/G, FTM/G, FTA/G, •FG%, •3P%, •FT%, •eFG%, •TS%, •TSA/G (true shot attempts =
+FGA + .44·FTA, i.e. usage without the turnovers), rFG%/r3P%/rFT%/reFG%/rTS%
+(each rate minus the games-weighted league average for the same season(s)
+— see "Relative shooting" below)
 
-**Usage** — ★USG%, ★USG Vol/G (raw plays used per game, not a %), MIN%
+**Per 100 possessions** — PTS/100, TRB/100, ORB/100, DRB/100, AST/100,
+STL/100, BLK/100, TOV/100, PF/100, FGM/100, FGA/100, 3PM/100, 3PA/100,
+FTM/100, FTA/100, Poss/G (the player's own estimated possessions per game).
+Off by default, like /36. See "Per 100 possessions" below for the method and
+the era limits.
+
+**Usage** — •USG%, •USG Vol/G (raw plays used per game, not a %), MIN%
 (share of the team's total floor time this player occupied)
 
 **Team context** — Team PTS/G, Team Poss/G, Team Pace (real two-team pace
 formula, not a single-team estimate — see below), Team ORtg, Team DRtg,
-Net Rtg (ORtg − DRtg), Team W%
+Net Rtg (ORtg − DRtg), Team MOV (plain, un-pace-adjusted average scoring
+margin), Team W%, Avg Seed (approx) (regular-season-only average of the
+same approximate conference seed used in the playoff series breakdown —
+see "Playoff depth & series" below for its caveats)
 
 **Consistency** — MIN/PTS/TRB/AST/STL/BLK/TOV/3PM/FGM/FTM/TSA/Usage
 Vol/TS% CV% (coefficient of variation — see below), plus
@@ -131,8 +155,8 @@ MIN/PTS/TRB/AST/STL/BLK/TS% Floor (P10)
 **Other** — +/- Std Dev
 
 **Playoff depth** — Championships, Finals Apps, Series W, Series L, Best
-Round Reached, Playoff Seasons (all span-level aggregates — see "Playoff
-depth & series" below for how these are derived)
+Round Reached, Playoff Seasons, Series Missed (Injury) (all span-level
+aggregates — see "Playoff depth & series" below for how these are derived)
 
 **League percentiles** — PTS/TRB/AST/STL/BLK/TOV/FG%/3P%/FT%/eFG%/TS% %ile
 (see "League percentiles" below)
@@ -156,6 +180,90 @@ game (early exit, garbage-time line) shouldn't define "what to expect on
 a bad night" — the floor means "about 1 game in 10 is this bad or worse,"
 which is a more realistic idea of a bad-night baseline.
 
+### What "relative shooting" (rFG%, r3P%, rFT%, reFG%, rTS%) means
+
+Each shooting rate minus the games-weighted league average for that exact
+same set of seasons — e.g. `rTS%` of `+.032` means 3.2 percentage points
+better than the league average across the seasons this span covers.
+League averages are computed from every game that season (totals summed,
+rate computed once — same convention used everywhere else here), not
+just qualifying players. Unlike percentiles (below), this is meaningful
+for a **Duo** span too, since it's plain subtraction against a league
+baseline rather than a rank against a distribution of individual players.
+
+### Per 100 possessions — and what the ★ means
+
+`/100` rows are Basketball-Reference's "Per 100 Poss": the stat per 100 team
+possessions the player was on the floor for. A box score never records how
+many possessions a player was out there for, so it's the standard estimate —
+the team's possessions over these exact games, prorated by the share of the
+team's floor time he occupied:
+
+```
+team_poss   = FGA − OREB + TOV + .44·FTA      (summed over the span)
+player_poss = player_MIN × team_poss / (team_MIN / 5)
+per_100     = 100 × stat / player_poss
+```
+
+`team_MIN / 5` converts the team's ~240 player-minutes into minutes of game
+clock, so `team_poss / (team_MIN/5)` is possessions per minute of game clock
+— **this team's own measured pace over these exact games**, not a league
+constant and not an era assumption. The one assumption is that the team ran
+at its full-game pace while this player was on the floor, which is the same
+assumption Basketball-Reference makes for its per-100 table.
+
+That assumption is the whole reason these rows say something `/36` can't:
+per-36 is blind to pace, so it reads a 107-possession 1980 Lakers game and a
+90-possession 1991 Bulls game as the same amount of playing time.
+
+**Why there's no constant-pace fallback.** The tempting shortcut for the old
+seasons is to plug in a fixed league or era pace. Don't: per-100 then becomes
+per-36 multiplied by a constant, which adds exactly zero information while
+*looking* like a possession adjustment. It also isn't standard —
+Basketball-Reference declines to publish pace before 1973-74 for the same
+reason. Where the possessions can't be estimated, these rows show `—`.
+
+**Era coverage, and the ★.** The team logs only carry FGA/FTA/TOV/OREB from
+**1985** onward. Before that they're empty, which would blank out every
+per-100 row (and Pace/ORtg/DRtg, as it always has). But the *player* logs
+reach further back for some of those columns, so where the official team line
+is missing, it's rebuilt by summing every player row in that game — see
+`data._reconstructed_team_lines`. A column is only rebuilt when every player
+row in the game has it, and only when the summed player minutes match the
+official team minutes (which is how a partial roster gets rejected, and how
+overtime games pass automatically).
+
+| Seasons | Source | Marked |
+|---|---|---|
+| 1985– | official team box scores | no |
+| 1977–1984 | rebuilt from summed player rows | ★ |
+| –1976 | not computable at all | shows `—` |
+
+Anything resting on a rebuilt line gets a **★** next to it in the table, with
+a footnote. Two reasons it's a caveat and not just a footnote of pedantry:
+coverage inside 1977-1984 is partial (roughly 35% of games in the thinnest
+seasons up to ~93% in 1983) and clusters by team, and team turnovers that
+aren't charged to any individual player are missing from the sum, which makes
+rebuilt possessions run about 0.6% light. Checked against 2020, where these
+sums reproduce official team FGA/FTA/OREB/PTS exactly.
+
+Nothing before 1977 is recoverable from any source here: turnovers weren't
+recorded (nor offensive rebounds before 1973-74), and without them there is
+no possession estimate to make. Wilt's 1971-72 shows `—` on every /100 row —
+correctly.
+
+The star is only ever applied to rows that actually come out of the team box
+score (`/100`, `Poss/G`, `USG%`, `MIN%`, `USG Vol/G`, and the Team
+Pace/ORtg/DRtg/Net Rtg/PTS/Poss rows). A player's own `PTS/G` is official in
+every season and never gets marked. `Team MOV` isn't marked either — it needs
+only team and opponent points, which the official logs have back to 1946, so
+it's computed off its own looser subset and is never an estimate.
+
+**Duo spans** behave for `/100` exactly as they already do for `/36`: summed
+stats over summed possessions is a minutes-weighted blend of the two players'
+rates, not their combined output. `Poss/G` for a duo is likewise both
+players' possessions added, the same way `MIN/G` is.
+
 ### Team ORtg / DRtg / Pace — what's real here, and what isn't
 
 **Team-level** ORtg/DRtg/Pace are computed properly. ORtg = 100 × team
@@ -168,6 +276,11 @@ the standard NBA formula — both sides' possessions, normalized to a
 overtime): `48 × ((team_poss + opp_poss) / (2 × (team_MIN / 5)))`. This
 needed team minutes, which wasn't wired into anything until it got added
 alongside player MIN/G.
+
+These used to come back blank for every season before 1985, since the team
+logs have no possession columns that far back. They now fill in for roughly
+1977-1984 from rebuilt team lines, marked with a ★ — see "Per 100
+possessions" above.
 
 **Individual (player-level) ORtg/DRtg are NOT implemented.** The real
 Dean Oliver formula chains together roughly 15 intermediate terms (a
@@ -243,6 +356,16 @@ championships are all inferred from the game logs themselves:
   least one game for that team that postseason — there's no roster data
   here, only game logs, so a player who missed an *entire* postseason for
   a team can't be picked up this way regardless of the fix.
+- **Series Missed (Injury)** counts the DNP series above directly — how
+  many of a span's series it got championship/record credit for despite
+  having zero box score rows in that specific series.
+- **Duo spans use each half's own W/L, not the team's.** `compute_series_records()`
+  takes a `wl_from_player_games` flag for this — a Duo's GP/W/L columns
+  come from the two players' own combined games (see "Duo mode" below),
+  not the team's full series record, so games one half of the duo sat out
+  don't get credited or blamed on the pair. **Result** and **Champion**
+  always reflect the team's actual series outcome regardless of this flag
+  — those are facts about the series, not about who played in it.
 
 ### League percentiles
 
@@ -265,6 +388,15 @@ Qualifier: minimum 10 games for regular season, 1 game for playoffs
 (series are short, and playoff appearance is already a relevance filter).
 Adjustable via `min_games` in `percentiles.season_league_table()`.
 
+**Not shown for a Duo span** — a percentile ranks one value against the
+distribution of *individual* players in the league, so a duo's combined
+per-game total would trivially read near the 100th percentile against
+that same distribution. `aggregate_duo_span()` omits the `percentiles`
+key entirely for duo blocks (rendering as "--" in the table) rather than
+showing a misleading number. Use the relative shooting stats above
+instead for a duo — they subtract a league average rather than ranking
+against a player distribution, so they stay meaningful.
+
 **Efficiency**: one grouped calculation per (season, season_type) covers
 every player in the league at once (~500 players from one pass over that
 season's rows) — it's not done per-player. Results are cached per
@@ -280,38 +412,81 @@ player each season, not just the stats already summable straight from
 player game logs — a real efficiency step up from what's here now. Ask if
 you want that built.
 
+## Duo mode
+
+Each row in the app is either a **Player** span or a **Duo** span. A Duo
+compares two teammates' *combined* numbers for the games they actually
+shared on the floor together — not the two players' individual careers
+added up.
+
+- **What counts as "played together"**: same `GAME_ID` + same `TEAM_ID`
+  (so they were both on the same roster for the same game), AND each
+  player logged at least 10 minutes that game (`data.DUO_MIN_MINUTES`).
+  A token garbage-time appearance or an early exit to injury doesn't
+  count — it'd technically share a `GAME_ID`/`TEAM_ID` but isn't
+  meaningful shared floor time.
+- **Season picker** for a Duo shows only seasons where they were actually
+  teammates for at least one qualifying game (`NBADataStore.seasons_together`)
+  — narrower than intersecting each player's individual seasons played,
+  which would also include seasons they were both merely active in the
+  league on different teams.
+- **What's summed vs. kept as-is**: counting stats (`PTS`, `REB`, `AST`,
+  etc.), minutes, and plus-minus are summed across the two players'
+  matching games. Game/team-level facts that are already identical for
+  both players in a shared game (season, team, matchup, opponent context,
+  team totals) are kept as-is rather than summed, which would double-count
+  them.
+- **USG% is the one stat that can't just sum the raw totals** — minutes
+  is USG%'s denominator, so summing minutes first before applying the
+  formula would bias the ratio. Each player's own USG% share is computed
+  individually (from their own minutes/plays over the same shared games)
+  and *those* are added, since usage shares are what actually combine
+  additively.
+- **Percentiles are omitted for Duo spans** (shown as "--") — a percentile
+  ranks against the distribution of individual players, and a duo's
+  combined per-game total would trivially read near the 100th percentile
+  against that distribution. Relative shooting (rFG%, rTS%, etc.) stays
+  meaningful for a Duo instead, since it's just subtraction against a
+  league average.
+- **Playoff series GP/W/L** reflect the duo's own combined record over
+  games they shared, not the team's full series record — see "Duo spans
+  use each half's own W/L" under "Playoff depth & series" above.
+- **Awards & Honors** are season-level data, not game-level, so a Duo's
+  row is simply both players' individual awards summed over the span's
+  seasons — not scoped to games they shared the way every other stat here is.
+
 ## Custom formulas
 
-Combine any existing stat with `+ - * / **` and parentheses — e.g.
-`PTS / USG_VOL_G` for points per used possession, or
-`TEAM_ORTG - TEAM_DRTG` (though that one's already built in as Net Rtg).
+Combine any existing stat, using the exact label shown in the comparison
+table (e.g. `PTS/G`, `TS%`, `USG Vol/G`), with `+ - * / **` and
+parentheses — e.g. `PTS/G / USG Vol/G` for points per used possession, or
+`Team ORtg - Team DRtg` (though that one's already built in as Net Rtg).
 
-This is **not** Python's `eval()` — `formulas.py` walks the parsed
-expression tree and only allows numbers, known variable names, and basic
-arithmetic. Function calls, attribute access, imports, anything else —
-none of it exists to execute, so there's no code-injection surface, even
-though the input is user-typed.
+This is **not** Python's `eval()` — `formulas.py` first swaps every known
+stat label in the expression for a safe placeholder identifier (so a
+label with characters that aren't valid in a bare Python identifier, like
+`MIN/G`, `TS%`, `+/-`, or `MIN Floor (P10)`, is treated as one atomic
+value rather than parsed as an operation), then walks the substituted
+expression as an AST that only allows numbers, those placeholders, and
+basic arithmetic. Function calls, attribute access, imports, anything
+else — none of it exists to execute, so there's no code-injection
+surface, even though the input is user-typed.
 
-Available variables (also shown in the app's "Available variable names"
-sidebar expander): counting stats per game (`PTS`, `REB`, `OREB`, `DREB`,
-`AST`, `STL`, `BLK`, `TOV`, `PF`, `FGM`, `FGA`, `FG3M`, `FG3A`, `FTM`,
-`FTA`), shooting (`FG_PCT`, `FG3_PCT`, `FT_PCT`, `EFG_PCT`, `TS_PCT`,
-`TSA_G`), minutes (`MIN_G`, `MIN_PCT`), plus-minus (`PLUS_MINUS`,
-`PLUS_MINUS_STD`), record (`W`, `L`, `GP`, `WIN_PCT`), usage (`USG_PCT`,
-`USG_VOL_G`), team context (`TEAM_PTS_G`, `TEAM_POSS_G`, `TEAM_PACE`,
-`TEAM_ORTG`, `TEAM_DRTG`, `TEAM_NET_RTG`), consistency (`*_CV` and
-`*_FLOOR` for every stat that has one, e.g. `PTS_CV`, `PTS_FLOOR`,
-`MIN_CV`, `TS_PCT_CV`), playoff depth (`CHAMPIONSHIPS`, `FINALS_APPS`,
-`SERIES_W`, `SERIES_L`, `BEST_ROUND`, `PLAYOFF_SEASONS`), league
-percentiles (`*_PCTILE`, e.g. `PTS_PCTILE`, `TS_PCT_PCTILE`).
+Available variables are every label in the stat catalog above, shown
+exactly as displayed in the table — also listed in the app's "Available
+variable names" sidebar expander. Any stat added to `table.STAT_DEFS`
+becomes usable in a formula automatically, with no separate variable-name
+mapping to maintain. Custom formulas can only reference built-in stats,
+not each other, which sidesteps chaining/self-reference/evaluation-order
+issues entirely.
 
 ## Save / Load
 
 Sidebar → "Save / Load setup" → **Generate save code** produces a compact
-text blob (or downloadable file) capturing your players, seasons, stat
-selection/order, and custom formulas. Paste it back in — in the same
-session or a completely different one — and **Load setup** rebuilds
-everything.
+text blob (or downloadable file) capturing your players and duos,
+seasons, stat selection/order, and custom formulas. Paste it back in —
+in the same session or a completely different one — and **Load setup**
+rebuilds everything.
 
 This is designed to survive future edits to the code, not just work today:
 
@@ -328,7 +503,7 @@ This is designed to survive future edits to the code, not just work today:
 ## Using it as a library (outside the app)
 
 ```python
-from nba_compare import PlayerSpan, NBADataStore, compare_spans, viz
+from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans, viz
 
 store = NBADataStore.from_config()
 
@@ -336,8 +511,10 @@ spans = [
     PlayerSpan.range(201939, "Stephen Curry", 2015, 2016, label="Curry 2015-16 & 2016-17"),
     PlayerSpan.single_season(201939, "Stephen Curry", 2021, label="Curry 2021-22"),
     PlayerSpan.career(2544, "LeBron James", store.seasons_played(2544)),
+    DuoSpan(201939, "Stephen Curry", 202691, "Klay Thompson",
+            seasons=store.seasons_together(201939, 202691), label="Splash Bros"),
 ]
-result = compare_spans(spans, store)
+result = compare_spans(spans, store)  # DuoSpan rows go through aggregate_duo_span() automatically
 
 result.summary()                          # quick GP/PPG/TS% snapshot, RS vs Playoffs
 result.wide_table("regular", "per_game")  # full per-game stat table
@@ -365,14 +542,3 @@ notebook/script use — `smoke_test.py` exercises this exact path.
   would overweight low-minute games.
 - Advanced metrics needing full season/league context (Win Shares, BPM,
   VORP) aren't computable from raw box scores alone and aren't included.
-
-## Extending it
-
-Ideas that fit cleanly into this structure:
-- Add a `per_100_poss` stat_group alongside `per_game`/`per_36` in `compare.py`.
-- Add game-log-level filters to `PlayerSpan` (home/away only, vs. a
-  specific opponent, only games the team won).
-- Build individual (player-level) ORtg/DRtg — see the caveat above; worth
-  validating against known values before trusting it.
-- Wire in a real accolades source (`accolades.py` has a stub +
-  instructions for scraping Basketball-Reference's Awards tables).

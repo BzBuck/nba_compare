@@ -15,6 +15,81 @@ from . import percentiles as _percentiles
 CONSISTENCY_STATS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "FGM", "FTM"]
 
 
+def _any_estimated(rows: pd.DataFrame) -> bool:
+    """
+    True if any of these rows had team box-score values rebuilt from summed
+    player lines instead of taken from the official team logs (see
+    data._fill_missing_team_stats) -- what the comparison table marks with
+    a star.
+
+    Always asked of the SUBSET a stat was actually computed from, never the
+    whole span: a pre-1977 row can carry TEAM_EST from a filled PTS while
+    still having no turnovers and so being dropped from every possession
+    calc, and flagging a number as estimated on the strength of a row that
+    didn't feed into it would be a lie in the other direction.
+    """
+    if "TEAM_EST" not in rows.columns:
+        return False
+    return bool(rows["TEAM_EST"].fillna(False).astype(bool).any())
+
+
+def _compute_per_100(games_with_team: pd.DataFrame) -> dict | None:
+    """
+    Every counting stat per 100 team possessions the player was on the floor
+    for -- Basketball-Reference's "Per 100 Poss" definition.
+
+    A box score doesn't record how many possessions a player was out there
+    for, so it's the standard estimate: take the team's possessions over
+    these games and prorate by the share of the team's floor time he
+    occupied.
+
+        team_poss   = FGA - OREB + TOV + 0.44*FTA   (summed over the games)
+        player_poss = player_MIN * team_poss / (team_MIN / 5)
+        per_100     = 100 * stat / player_poss
+
+    team_MIN/5 turns the team's ~240 player-minutes into minutes of game
+    clock, so team_poss / (team_MIN/5) is possessions per game minute --
+    this team's ACTUAL measured pace over these exact games, not a league
+    constant and not an era assumption. The only assumption is that the team
+    ran at its full-game pace while this player was on the floor, which is
+    the same one Basketball-Reference makes, and it's the whole reason
+    per-100 says something per-36 can't: per-36 is blind to pace, so it
+    reads a 1962 possession torrent and a 1999 rock fight as the same
+    playing time.
+
+    Totals are summed over the SAME subset of games as the possessions, so a
+    span where half the games lack team data reports the honest per-100 rate
+    of the half that has it, rather than full-span production divided by
+    half-span possessions. Returns None when no game has usable team
+    columns -- every season before 1977, where turnovers simply weren't
+    recorded and there is no possession estimate to be made from any source.
+    """
+    valid = games_with_team.dropna(subset=["TEAM_MIN", "TEAM_FGA", "TEAM_FTA", "TEAM_TOV", "TEAM_OREB"])
+    if valid.empty:
+        return None
+
+    team_poss = (valid["TEAM_FGA"] - valid["TEAM_OREB"] + valid["TEAM_TOV"]
+                 + 0.44 * valid["TEAM_FTA"]).sum()
+    team_game_min = valid["TEAM_MIN"].sum() / 5
+    player_min = valid["MIN_NUM"].sum()
+    if not team_poss or not team_game_min or not player_min:
+        return None
+
+    player_poss = player_min * team_poss / team_game_min
+    if not player_poss:
+        return None
+
+    n = len(valid)
+    return {
+        "per_100": {c: 100 * valid[c].sum() / player_poss for c in COUNTING_STATS},
+        "player_poss": player_poss,
+        "player_poss_per_game": player_poss / n,
+        "games_with_poss_data": n,
+        "games_missing_poss_data": len(games_with_team) - n,
+        "estimated": _any_estimated(valid),
+    }
+
+
 def _compute_usage(games_with_team: pd.DataFrame) -> dict | None:
     """
     Usage% aggregated across the whole span the same way Basketball-Reference
@@ -69,6 +144,7 @@ def _compute_usage(games_with_team: pd.DataFrame) -> dict | None:
         "min_pct": min_pct,
         "games_with_team_data": n,
         "games_missing_team_data": len(games_with_team) - n,
+        "estimated": _any_estimated(valid),
     }
 
 
@@ -139,6 +215,13 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
     valid_mov = games_with_team.dropna(subset=["TEAM_PTS", "OPP_PTS"])
     if not valid_mov.empty:
         result["team_mov"] = (valid_mov["TEAM_PTS"] - valid_mov["OPP_PTS"]).mean()
+
+    # Whether these team numbers rest on rebuilt box-score lines. Read off
+    # `valid` (the possession subset), not valid_mov -- TEAM_PTS/OPP_PTS are
+    # present in the official logs for every season back to 1946, so MOV is
+    # never an estimate even when everything around it is, and table.py
+    # deliberately leaves that row unstarred.
+    result["estimated"] = _any_estimated(valid)
 
     pace_cols = ["TEAM_MIN", "TEAM_FGA", "TEAM_OREB", "TEAM_FTA", "TEAM_TOV",
                  "OPP_FGA", "OPP_OREB", "OPP_FTA", "OPP_TOV"]
@@ -242,6 +325,7 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
     # came from games_with_team_context(). Fall back to None otherwise.
     usage = _compute_usage(games) if "TEAM_MIN" in games.columns else None
     team = _compute_team_context(games) if "TEAM_PTS" in games.columns else None
+    possessions = _compute_per_100(games) if "TEAM_MIN" in games.columns else None
 
     return {
         "games": gp,
@@ -252,6 +336,11 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
         "totals": totals,
         "per_game": per_game,
         "per_36": per_36,
+        # Per-100 is None (not zeros) whenever no game in the span has the
+        # team possession columns -- i.e. anything before 1977. Callers must
+        # treat it as optional the way they already do "usage"/"team".
+        "per_100": possessions["per_100"] if possessions else None,
+        "possessions": possessions,
         "shooting": shooting,
         "tsa_per_game": tsa_per_game,
         "usage": usage,
@@ -388,18 +477,27 @@ class ComparisonResult:
     def wide_table(self, season_type: str = "regular", stat_group: str = "per_game") -> pd.DataFrame:
         """
         One row per stat, one column per span. season_type: 'regular'|'playoffs'.
-        stat_group: 'per_game'|'per_36'|'totals'|'shooting'.
+        stat_group: 'per_game'|'per_36'|'per_100'|'totals'|'shooting'.
+
+        An empty column means either no games in the span or no data for
+        that group -- 'per_100' is legitimately absent for pre-1977 spans
+        (see _compute_per_100), so it's read with .get() rather than [].
         """
         cols = {}
         for agg in self.aggregates:
             block = agg[season_type]
-            cols[agg["label"]] = block[stat_group] if block else {}
+            cols[agg["label"]] = (block.get(stat_group) or {}) if block else {}
         return pd.DataFrame(cols)
 
     def long_table(self) -> pd.DataFrame:
         """
-        Tidy long-format table across BOTH season types and per_game/per_36, for plotting.
+        Tidy long-format table across BOTH season types and
+        per_game/per_36/per_100, for plotting.
         Columns: span, season_type, stat_group, stat, value
+
+        Spans with no per-100 data (pre-1977) contribute no per_100 rows at
+        all rather than rows of None, so a plot over this frame simply has
+        nothing to draw for them instead of a line at zero.
         """
         rows = []
         for agg in self.aggregates:
@@ -407,8 +505,8 @@ class ComparisonResult:
                 block = agg[season_type]
                 if not block:
                     continue
-                for stat_group in ("per_game", "per_36", "shooting"):
-                    for stat, value in block[stat_group].items():
+                for stat_group in ("per_game", "per_36", "per_100", "shooting"):
+                    for stat, value in (block.get(stat_group) or {}).items():
                         rows.append({
                             "span": agg["label"],
                             "season_type": season_type,

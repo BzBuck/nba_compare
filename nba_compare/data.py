@@ -17,6 +17,16 @@ COUNTING_STATS = [
     "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
 ]
 
+# Team box-score columns every possession-based number is built from
+# (pace, ORtg/DRtg, USG%, and all the per-100 stats). The team parquet only
+# carries these in full from 1985 onward -- see _reconstructed_team_lines.
+TEAM_POSSESSION_STATS = ["FGA", "FTA", "TOV", "OREB", "PTS"]
+
+# How far a game's summed player minutes may sit from the official team
+# minutes before the player rows are treated as an incomplete roster and
+# not used to rebuild that team line (see _fill_missing_team_stats).
+ROSTER_MINUTES_TOLERANCE = 5.0
+
 # Minimum minutes EACH player in a duo must log in a game for it to count
 # as "played together" -- excludes token appearances (a garbage-time minute
 # in a blowout, an early exit to injury) that technically share a GAME_ID/
@@ -50,6 +60,61 @@ def _prep(df: pd.DataFrame) -> pd.DataFrame:
     df["SEASON"] = df["SEASON_ID"].astype(str).str[1:].astype(int)
     df["MIN_NUM"] = _to_minutes(df["MIN"])
     return df
+
+
+def _fill_missing_team_stats(
+    merged: pd.DataFrame, recon: pd.DataFrame, prefix: str, id_col: str
+) -> pd.DataFrame:
+    """
+    Fill NaN <prefix>_FGA/FTA/TOV/OREB/PTS columns from `recon` (team lines
+    rebuilt by summing player rows -- see
+    NBADataStore._reconstructed_team_lines), matched on GAME_ID + id_col.
+    Official values are never overwritten; this only fills gaps.
+
+    A rebuilt line is only trusted where its summed player minutes agree
+    with the OFFICIAL team minutes for that game (within
+    ROSTER_MINUTES_TOLERANCE). That's the check that the player rows are a
+    complete roster and not a partial scrape -- and it handles overtime
+    games for free, since their minutes total is higher than the usual 240
+    on both sides of the comparison. Games whose official minutes are
+    missing or zero (some 1960s rows) get no fill at all.
+
+    Accumulates a boolean TEAM_EST column marking rows where at least one
+    value came from a rebuilt line rather than the official team logs --
+    that's what the comparison table stars.
+    """
+    if merged.empty or id_col not in merged.columns:
+        return merged
+
+    # TEAM_ID arrives as int64 on the player's own side but float64 on the
+    # opponent side (the left join introduces NaN for unmatched games), and
+    # pandas refuses to merge those against each other -- so both sides of
+    # the key go to float64. Team IDs are ~1.6e9, exactly representable.
+    key = "_join_team_id"
+    left = merged.assign(**{key: merged[id_col].astype("float64")})
+    src_cols = TEAM_POSSESSION_STATS + ["MIN_NUM"]
+    right = recon.assign(**{key: recon["TEAM_ID"].astype("float64")})
+    right = right[["GAME_ID", key] + src_cols].rename(
+        columns={c: f"_recon_{c}" for c in src_cols}
+    )
+    out = left.merge(right, on=["GAME_ID", key], how="left")
+
+    official_min = out[f"{prefix}_MIN"]
+    roster_complete = (
+        (out["_recon_MIN_NUM"] - official_min).abs() <= ROSTER_MINUTES_TOLERANCE
+    ) & (official_min > 0)
+
+    estimated = pd.Series(False, index=out.index)
+    for stat in TEAM_POSSESSION_STATS:
+        target = f"{prefix}_{stat}"
+        available = out[f"_recon_{stat}"].where(roster_complete)
+        gap = out[target].isna() & available.notna()
+        out.loc[gap, target] = available[gap]
+        estimated |= gap
+
+    prior = out["TEAM_EST"] if "TEAM_EST" in out.columns else False
+    out["TEAM_EST"] = estimated | prior
+    return out.drop(columns=[key] + [f"_recon_{c}" for c in src_cols])
 
 
 class NBADataStore:
@@ -89,6 +154,41 @@ class NBADataStore:
             self._cache[key] = _prep(pd.read_parquet(self._paths[key]))
         return self._cache[key]
 
+    def _reconstructed_team_lines(self, season_type: str) -> pd.DataFrame:
+        """
+        Team box-score lines rebuilt by SUMMING the player game logs per
+        GAME_ID + TEAM_ID -- a fallback for the seasons where the official
+        team parquet simply doesn't have them.
+
+        The team logs carry no FGA/FTA/TOV/OREB at all before 1985, but the
+        player logs go further back for some of them (FGA into the 1960s,
+        OREB from 1973-74, TOV from 1977-78), so summing players recovers a
+        usable team line for roughly 1977-1984 -- and nothing before that,
+        since with no turnovers recorded there is no possession estimate to
+        make at any level.
+
+        A column is only rebuilt when EVERY player row in that game/team
+        has it: one null in the roster would make the sum silently
+        undercount, so it's left missing instead. Checked against 2020,
+        where these sums reproduce official team FGA/FTA/OREB/PTS exactly;
+        TOV comes in ~0.6/game low because team turnovers aren't charged to
+        any individual player, which makes possessions built this way about
+        0.6% light. Coverage over 1977-1984 runs from ~35% of games to ~93%
+        (best in 1983), and the games that survive are clustered by team,
+        so a rebuilt league-wide average is a few points off a true one --
+        why anything resting on these is starred in the table rather than
+        shown as equivalent to the post-1985 numbers.
+        """
+        cache_key = f"recon_{season_type}"
+        if cache_key not in self._cache:
+            df = self._load(season_type)
+            cols = TEAM_POSSESSION_STATS + ["MIN_NUM"]
+            group_keys = [df["GAME_ID"], df["TEAM_ID"]]
+            sums = df[cols].groupby(group_keys).sum(min_count=1)
+            null_counts = df[cols].isna().groupby(group_keys).sum()
+            self._cache[cache_key] = sums.mask(null_counts > 0).reset_index()
+        return self._cache[cache_key]
+
     def games(self, player_id: int, seasons: list[int], season_type: str) -> pd.DataFrame:
         """season_type: 'regular' or 'playoffs'"""
         df = self._load(season_type)
@@ -119,6 +219,14 @@ class NBADataStore:
 
         Rows where no match is found get NaN in the relevant columns --
         callers should filter those out before computing with them.
+
+        Because the team parquet has no possession columns at all before
+        1985, any gap left in TEAM_*/OPP_* FGA/FTA/TOV/OREB/PTS is then
+        filled where possible from team lines rebuilt out of the player
+        logs (see _reconstructed_team_lines), and the boolean TEAM_EST
+        column marks the rows where that happened, so downstream stats can
+        be flagged as estimates rather than passed off as officially
+        sourced.
         """
         player_df = self.games(player_id, seasons, season_type)
         team_key = "team_regular" if season_type == "regular" else "team_playoffs"
@@ -132,9 +240,12 @@ class NBADataStore:
         )
         merged = player_df.merge(team_slim, on=["GAME_ID", "TEAM_ID"], how="left")
 
-        opp_slim = team_df[["GAME_ID", "TEAM_ID", "PTS", "FGA", "FTA", "TOV", "OREB"]].rename(
+        # OPP_MIN isn't used in any stat directly -- it's the completeness
+        # check that lets a rebuilt OPPONENT line be trusted, the same way
+        # TEAM_MIN does for the player's own team.
+        opp_slim = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM", "PTS", "FGA", "FTA", "TOV", "OREB"]].rename(
             columns={
-                "TEAM_ID": "OPP_TEAM_ID", "PTS": "OPP_PTS", "FGA": "OPP_FGA",
+                "TEAM_ID": "OPP_TEAM_ID", "MIN_NUM": "OPP_MIN", "PTS": "OPP_PTS", "FGA": "OPP_FGA",
                 "FTA": "OPP_FTA", "TOV": "OPP_TOV", "OREB": "OPP_OREB",
             }
         )
@@ -144,6 +255,12 @@ class NBADataStore:
         merged = merged.merge(opp_slim, on="GAME_ID", how="left")
         merged = merged[(merged["OPP_TEAM_ID"].isna()) | (merged["OPP_TEAM_ID"] != merged["TEAM_ID"])]
         merged = merged.drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
+
+        recon = self._reconstructed_team_lines(season_type)
+        merged = _fill_missing_team_stats(merged, recon, "TEAM", "TEAM_ID")
+        merged = _fill_missing_team_stats(merged, recon, "OPP", "OPP_TEAM_ID")
+        if "TEAM_EST" not in merged.columns:
+            merged["TEAM_EST"] = False
         return merged
 
     def seasons_together(

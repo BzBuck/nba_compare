@@ -21,12 +21,36 @@ STAT_DEFS = {
     "MIN/G":      (lambda b: b["minutes_per_game"],                     "{:.1f}", False),
     "PTS/G":      (lambda b: b["per_game"]["PTS"],                      "{:.1f}", False),
     "TRB/G":      (lambda b: b["per_game"]["REB"],                      "{:.1f}", False),
+    "ORB/G":      (lambda b: b["per_game"]["OREB"],                     "{:.1f}", False),
+    "DRB/G":      (lambda b: b["per_game"]["DREB"],                     "{:.1f}", False),
     "AST/G":      (lambda b: b["per_game"]["AST"],                      "{:.1f}", False),
     "STL/G":      (lambda b: b["per_game"]["STL"],                      "{:.1f}", False),
     "BLK/G":      (lambda b: b["per_game"]["BLK"],                      "{:.1f}", False),
     "TOV/G":      (lambda b: b["per_game"]["TOV"],                      "{:.1f}", True),
     "PF/G":       (lambda b: b["per_game"]["PF"],                       "{:.1f}", True),
     "+/-":        (lambda b: b["plus_minus_per_game"],                  "{:+.1f}", False),
+    "FGM/G":      (lambda b: b["per_game"]["FGM"],                       "{:.1f}", False),
+    "FGA/G":      (lambda b: b["per_game"]["FGA"],                       "{:.1f}", False),
+    "3PM/G":      (lambda b: b["per_game"]["FG3M"],                      "{:.1f}", False),
+    "3PA/G":      (lambda b: b["per_game"]["FG3A"],                      "{:.1f}", False),
+    "FTM/G":      (lambda b: b["per_game"]["FTM"],                       "{:.1f}", False),
+    "FTA/G":      (lambda b: b["per_game"]["FTA"],                       "{:.1f}", False),
+    "PTS/100":    (lambda b: (b.get("per_100") or {}).get("PTS"),         "{:.1f}", False),
+    "TRB/100":    (lambda b: (b.get("per_100") or {}).get("REB"),         "{:.1f}", False),
+    "ORB/100":    (lambda b: (b.get("per_100") or {}).get("OREB"),        "{:.1f}", False),
+    "DRB/100":    (lambda b: (b.get("per_100") or {}).get("DREB"),        "{:.1f}", False),
+    "AST/100":    (lambda b: (b.get("per_100") or {}).get("AST"),         "{:.1f}", False),
+    "STL/100":    (lambda b: (b.get("per_100") or {}).get("STL"),         "{:.1f}", False),
+    "BLK/100":    (lambda b: (b.get("per_100") or {}).get("BLK"),         "{:.1f}", False),
+    "TOV/100":    (lambda b: (b.get("per_100") or {}).get("TOV"),         "{:.1f}", True),
+    "PF/100":     (lambda b: (b.get("per_100") or {}).get("PF"),          "{:.1f}", True),
+    "FGM/100":    (lambda b: (b.get("per_100") or {}).get("FGM"),         "{:.1f}", False),
+    "FGA/100":    (lambda b: (b.get("per_100") or {}).get("FGA"),         "{:.1f}", False),
+    "3PM/100":    (lambda b: (b.get("per_100") or {}).get("FG3M"),        "{:.1f}", False),
+    "3PA/100":    (lambda b: (b.get("per_100") or {}).get("FG3A"),        "{:.1f}", False),
+    "FTM/100":    (lambda b: (b.get("per_100") or {}).get("FTM"),         "{:.1f}", False),
+    "FTA/100":    (lambda b: (b.get("per_100") or {}).get("FTA"),         "{:.1f}", False),
+    "Poss/G":     (lambda b: (b.get("possessions") or {}).get("player_poss_per_game"), "{:.1f}", False),
     "FG%":        (lambda b: b["shooting"]["FG_PCT"],                   "{:.3f}", False),
     "3P%":        (lambda b: b["shooting"]["FG3_PCT"],                  "{:.3f}", False),
     "FT%":        (lambda b: b["shooting"]["FT_PCT"],                   "{:.3f}", False),
@@ -102,6 +126,49 @@ DEFAULT_STAT_LABELS = [
 ROW_FORMATS = {label: fmt for label, (_getter, fmt, _lower) in STAT_DEFS.items()}
 LOWER_IS_BETTER = {label for label, (_getter, _fmt, lower) in STAT_DEFS.items() if lower}
 
+# Star marker for a value that rests on rebuilt team box-score lines rather
+# than the official ones -- see ESTIMATED_SOURCES and data.py's
+# _reconstructed_team_lines. In practice this means 1977-1984.
+ESTIMATED_MARK = "\u2605"
+ESTIMATED_NOTE = (
+    "\u2605 Built from team box-score lines rebuilt by summing each game's individual "
+    "player rows \u2014 the official team logs carry no FGA/FTA/TOV/OREB before 1985. "
+    "Covers only part of each 1977\u20131984 season, and misses team turnovers that "
+    "aren't charged to a player, so treat these as close estimates rather than "
+    "settled numbers. Earlier seasons show \u2014: with no turnovers recorded there is "
+    "no possession estimate to make."
+)
+
+# Which rows CAN carry the star, and which part of the stat block knows
+# whether they do. Every one of these is computed out of the team box score,
+# so it's only these that a rebuilt team line can affect -- a player's own
+# PTS/G is official in every season and never gets marked.
+#
+# "Team MOV" is deliberately absent: it needs only TEAM_PTS/OPP_PTS, which
+# the official logs have back to 1946, so it's computed off its own subset
+# and is never an estimate (see compare._compute_team_context).
+ESTIMATED_SOURCES = {
+    **{label: "possessions" for label in STAT_DEFS if label.endswith("/100")},
+    "Poss/G": "possessions",
+    "MIN%": "usage",
+    "USG%": "usage",
+    "USG Vol/G": "usage",
+    "Team PTS/G": "team",
+    "Team Poss/G": "team",
+    "Team Pace": "team",
+    "Team ORtg": "team",
+    "Team DRtg": "team",
+    "Net Rtg": "team",
+}
+
+
+def _is_estimated(block: dict | None, label: str) -> bool:
+    """Whether this span's value for this row should be starred."""
+    source = ESTIMATED_SOURCES.get(label)
+    if block is None or source is None:
+        return False
+    return bool((block.get(source) or {}).get("estimated"))
+
 
 def build_stat_table(
     result: ComparisonResult,
@@ -133,6 +200,35 @@ def build_stat_table(
     return pd.DataFrame(data).reindex([l for l in stat_labels if l in stat_defs])
 
 
+def build_stat_flags(
+    result: ComparisonResult,
+    season_type: str = "regular",
+    stat_labels: list[str] | None = None,
+    stat_defs: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Booleans in the SAME shape and order as build_stat_table: True where that
+    span's value for that row came out of rebuilt team box-score lines and so
+    should be starred. Pass to render_stat_table_html(flags=...).
+
+    Built as a separate frame rather than as part of the table because
+    build_stat_table has to stay purely numeric -- that's what the best/worst
+    highlighting compares on. Custom formulas never flag, even when they
+    reference a starred stat; a formula's provenance isn't tracked, and
+    guessing at it would be worse than leaving it unmarked.
+    """
+    stat_defs = stat_defs if stat_defs is not None else STAT_DEFS
+    stat_labels = stat_labels if stat_labels is not None else DEFAULT_STAT_LABELS
+    data = {}
+    for agg in result.aggregates:
+        block = agg[season_type]
+        data[agg["label"]] = {
+            label: _is_estimated(block, label)
+            for label in stat_labels if label in stat_defs
+        }
+    return pd.DataFrame(data).reindex([l for l in stat_labels if l in stat_defs])
+
+
 def formats_and_lower_is_better(stat_defs: dict) -> tuple[dict, set]:
     """Derive the {label: format} and {lower_is_better labels} needed by
     render_stat_table_html from any stat_defs dict, including one merged
@@ -147,6 +243,7 @@ def render_stat_table_html(
     title: str = "",
     formats: dict | None = None,
     lower_is_better: set | None = None,
+    flags: pd.DataFrame | None = None,
 ) -> str:
     """
     Formats + highlights the best (green) and worst (red) value per row,
@@ -160,9 +257,21 @@ def render_stat_table_html(
     formats/lower_is_better default to the main STAT_DEFS rules; pass the
     output of formats_and_lower_is_better(your_stat_defs) for a table built
     from a different/merged stat_defs (e.g. including custom formulas).
+
+    flags (from build_stat_flags, same shape as df) stars the cells whose
+    value rests on rebuilt team data, and appends ESTIMATED_NOTE under the
+    table -- only when at least one cell is actually starred, so tables of
+    purely official numbers stay clean.
     """
     formats = formats if formats is not None else ROW_FORMATS
     lower_is_better = lower_is_better if lower_is_better is not None else LOWER_IS_BETTER
+
+    def is_flagged(row_label, col):
+        if flags is None or row_label not in flags.index or col not in flags.columns:
+            return False
+        return bool(flags.at[row_label, col])
+
+    any_flagged = False
 
     def fmt_cell(row_label, value):
         if value is None or pd.isna(value):
@@ -186,6 +295,9 @@ def render_stat_table_html(
         for col in df.columns:
             v = values[col]
             text = fmt_cell(row_label, v)
+            if v is not None and not pd.isna(v) and is_flagged(row_label, col):
+                any_flagged = True
+                text += f'<span style="opacity:.75;font-size:.8em;vertical-align:super;">{ESTIMATED_MARK}</span>'
             is_best = best is not None and v == best
             is_worst = (not is_best) and worst is not None and v == worst
             if is_best:
@@ -205,6 +317,11 @@ def render_stat_table_html(
         f'<th style="padding:5px 14px;text-align:left;color:#eee;border-bottom:1px solid #333;">{c}</th>'
         for c in df.columns
     )
+    note_html = (
+        f'<div style="margin-top:8px;color:#888;font-size:.8em;max-width:820px;line-height:1.45;">'
+        f'{ESTIMATED_NOTE}</div>'
+        if any_flagged else ''
+    )
     return f"""
     <div style="font-family:-apple-system,sans-serif;">
       {f'<h4 style="margin-bottom:6px;color:#eee;">{title}</h4>' if title else ''}
@@ -212,6 +329,7 @@ def render_stat_table_html(
         <tr><th style="padding:5px 14px;border-bottom:1px solid #333;"></th>{header_cells}</tr>
         {''.join(rows_html)}
       </table>
+      {note_html}
     </div>
     """
 

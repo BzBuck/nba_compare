@@ -15,7 +15,7 @@ from streamlit_sortables import sort_items
 from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans, AccoladeStore
 from nba_compare.players import search_players
 from nba_compare.table import (
-    build_stat_table, render_stat_table_html, build_awards_table,
+    build_stat_table, build_stat_flags, render_stat_table_html, build_awards_table,
     formats_and_lower_is_better, STAT_DEFS, DEFAULT_STAT_LABELS,
 )
 from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_formula
@@ -559,16 +559,28 @@ else:
     else:
         if has_regular:
             reg_table = build_stat_table(result, "regular", stat_labels=stat_labels, stat_defs=combined_stat_defs)
+            reg_flags = build_stat_flags(result, "regular", stat_labels=stat_labels, stat_defs=combined_stat_defs)
             st.markdown(
-                render_stat_table_html(reg_table, "Regular Season", formats=formats, lower_is_better=lower_is_better),
+                render_stat_table_html(reg_table, "Regular Season", formats=formats,
+                                       lower_is_better=lower_is_better, flags=reg_flags),
                 unsafe_allow_html=True,
             )
         if has_playoffs:
             st.markdown("<br>", unsafe_allow_html=True)
             po_table = build_stat_table(result, "playoffs", stat_labels=stat_labels, stat_defs=combined_stat_defs)
+            po_flags = build_stat_flags(result, "playoffs", stat_labels=stat_labels, stat_defs=combined_stat_defs)
             st.markdown(
-                render_stat_table_html(po_table, "Playoffs", formats=formats, lower_is_better=lower_is_better),
+                render_stat_table_html(po_table, "Playoffs", formats=formats,
+                                       lower_is_better=lower_is_better, flags=po_flags),
                 unsafe_allow_html=True,
+            )
+        if any(lbl.endswith("/100") or lbl == "Poss/G" for lbl in stat_labels):
+            st.caption(
+                "**/100** = per 100 team possessions the player was on the floor for, using that "
+                "team's own measured pace over these exact games — the pace-aware counterpart to "
+                "/36, which can't tell a 100-possession game from an 85-possession one. Possessions "
+                "come out of the team box score, so these rows are blank for seasons before 1977: "
+                "turnovers weren't recorded, and without them there's no possession estimate to make."
             )
         if any(lbl.endswith("CV%") for lbl in stat_labels):
             st.caption(
