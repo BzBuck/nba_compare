@@ -9,8 +9,11 @@ How series/rounds are identified:
   one team in one season. Since a team never faces two different opponents
   interleaved within a single postseason, this reliably separates series
   even without an explicit round/series ID in the source data.
-- "Round number" is just that team's Nth series chronologically that
-  postseason -- correct regardless of how many rounds existed that era.
+- "Round number" is the LEAGUE round, not just that team's Nth series:
+  a series is one round past the latest round either team has already
+  played (see _league_rounds). The two only differ for a team with a bye
+  -- a top seed skipping straight to the semifinals (NBA 1975-83, WNBA
+  2016-21) plays its first series in round 3, not round 1.
 
 How championship detection avoids hardcoding "round 4 = Finals":
 - league_round_depth() looks at ALL teams' playoff series that season
@@ -28,6 +31,7 @@ See its docstring for exactly what it doesn't account for.
 from __future__ import annotations
 import pandas as pd
 from .data import NBADataStore
+from .models import season_str
 
 STANDARD_ROUND_LABELS = {1: "First Round", 2: "Conf Semis", 3: "Conf Finals", 4: "Finals"}
 
@@ -43,6 +47,25 @@ EASTERN_TEAMS = {
 WESTERN_TEAMS = {
     "DAL", "DEN", "GSW", "HOU", "LAC", "LAL", "MEM", "VAN", "MIN", "NOP",
     "NOH", "NOK", "OKC", "SEA", "PHX", "POR", "SAC", "SAS", "UTA",
+}
+
+# The WNBA's own table -- its abbreviations overlap the NBA's (CHA, MIA,
+# SEA, ...) but mean different teams, some in the other conference. Every
+# franchise 1997-2026, defunct ones included. One simplification: Houston
+# played in the East in 1997 only.
+WNBA_EASTERN_TEAMS = {
+    "ATL", "CHA", "CHI", "CLE", "CON", "DET", "IND", "MIA", "NYL", "ORL", "TOR", "WAS",
+}
+WNBA_WESTERN_TEAMS = {
+    "DAL", "GSV", "HOU", "LAS", "LVA", "MIN", "PDX", "PHO", "PHX", "POR", "SAC",
+    "SAN", "SEA", "TUL", "UTA",
+}
+# From 2016 the WNBA seeds its playoff field league-wide, ignoring conference.
+WNBA_LEAGUEWIDE_SEEDING_FROM = 2016
+
+CONFERENCES = {
+    "NBA": {"East": EASTERN_TEAMS, "West": WESTERN_TEAMS},
+    "WNBA": {"East": WNBA_EASTERN_TEAMS, "West": WNBA_WESTERN_TEAMS},
 }
 
 
@@ -68,7 +91,15 @@ def _home_court_from_matchup(matchup: str) -> str | None:
     return None
 
 
-def _label_round(round_num: int, total_rounds: int) -> str:
+def _label_round(round_num: int, total_rounds: int, league: str = "NBA") -> str:
+    if league == "WNBA":
+        # The WNBA has run 2 to 4 rounds, and without conference rounds
+        # since 2016 -- so name rounds back from the Finals, not by count.
+        if round_num == total_rounds:
+            return "Finals"
+        if round_num == total_rounds - 1:
+            return "Semifinals"
+        return {1: "First Round", 2: "Second Round"}.get(round_num, f"Round {round_num}")
     if total_rounds == 4:
         return STANDARD_ROUND_LABELS.get(round_num, f"Round {round_num}")
     return "Finals" if round_num == total_rounds else f"Round {round_num}"
@@ -119,16 +150,49 @@ def identify_series(playoff_games: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts).sort_index()
 
 
+def _league_rounds(season_team_games: pd.DataFrame) -> pd.DataFrame:
+    """
+    Every team's series for one postseason (all teams' playoff rows from
+    the team parquet), with ROUND set to the LEAGUE round rather than the
+    team's own series count. Walking series in the order they start, each
+    one is round 1 + the latest round either team has already played -- so
+    a team coming off a double bye meets a two-round survivor in round 3,
+    and brackets without byes come out exactly as the per-team count would.
+    """
+    if season_team_games.empty:
+        return season_team_games.assign(OPPONENT=None, SERIES_ID=None, ROUND=None)
+    games = pd.concat(
+        _identify_series_for_group(g) for _, g in season_team_games.groupby("TEAM_ID")
+    )
+    series = (
+        games.groupby(["TEAM_ID", "SERIES_ID"])
+        .agg(start=("GAME_DATE", "min"), team=("TEAM_ABBREVIATION", "first"), opp=("OPPONENT", "first"))
+        .reset_index()
+        .sort_values("start", kind="stable")
+    )
+    latest: dict[str, int] = {}     # team abbreviation -> latest round played
+    matchups: dict[tuple, int] = {}  # (both teams, start) -> round, shared by both sides
+    rounds = {}
+    for row in series.itertuples():
+        key = (frozenset((row.team, row.opp)), row.start)
+        if key not in matchups:
+            matchups[key] = 1 + max(latest.get(row.team, 0), latest.get(row.opp, 0))
+            latest[row.team] = latest[row.opp] = matchups[key]
+        rounds[(row.TEAM_ID, row.SERIES_ID)] = matchups[key]
+    games["ROUND"] = [rounds[k] for k in zip(games["TEAM_ID"], games["SERIES_ID"])]
+    return games
+
+
 def team_series_structure(store: NBADataStore, team_id: int, season: int) -> pd.DataFrame:
     """The TEAM's full round-by-round series structure that postseason,
     from team-level game logs -- the authoritative source for round
     numbers/opponents/results, since a team's own log doesn't have gaps
     the way one player's log can when they miss games to injury."""
     team_games = store.team_games_for_season(season, "playoffs")
-    team_games = team_games[team_games["TEAM_ID"] == team_id]
-    if team_games.empty:
+    if not (team_games["TEAM_ID"] == team_id).any():
         return pd.DataFrame()
-    return _identify_series_for_group(team_games)
+    league = _league_rounds(team_games)
+    return league[league["TEAM_ID"] == team_id]
 
 
 def identify_series_for_player(store: NBADataStore, player_games: pd.DataFrame) -> list[dict]:
@@ -198,8 +262,7 @@ def league_round_depth(store: NBADataStore, season: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["TEAM_ID", "rounds_played", "won_final_series"])
 
     rows = []
-    for team_id, group in team_games.groupby("TEAM_ID"):
-        g = _identify_series_for_group(group)
+    for team_id, g in _league_rounds(team_games).groupby("TEAM_ID"):
         max_round = int(g["ROUND"].max())
         final = g[g["ROUND"] == max_round]
         wins, losses = int((final["WL"] == "W").sum()), int((final["WL"] == "L").sum())
@@ -277,7 +340,9 @@ def aggregate_series_group(records: list[dict]) -> dict | None:
     }
 
 
-_ROUND_ORDER_HINTS = {"First Round": 1, "Conf Semis": 2, "Conf Finals": 3, "Finals": 999}
+_ROUND_ORDER_HINTS = {
+    "First Round": 1, "Second Round": 2, "Conf Semis": 2, "Conf Finals": 3, "Semifinals": 3, "Finals": 999,
+}
 
 
 def _round_sort_key(label: str) -> tuple:
@@ -425,9 +490,9 @@ def compute_series_records(
             record_w, record_l = team_wins, team_losses
 
         records.append({
-            "Season": f"{season}-{str(season + 1)[-2:]}",
+            "Season": season_str(season, store.league),
             "SeasonSort": season,
-            "Round": _label_round(round_num, total_rounds),
+            "Round": _label_round(round_num, total_rounds, store.league),
             "RoundNum": round_num,
             "Opponent": opponent,
             "Result": "Won" if team_wins > team_losses else "Lost",
@@ -501,22 +566,27 @@ def depth_summary(records: list[dict]) -> dict:
 def estimate_conference_seed(store: NBADataStore, team_abbr: str, season: int) -> dict | None:
     """
     APPROXIMATE seed: ranks teams by regular-season win% within a
-    hardcoded conference table. This is NOT official seeding -- it doesn't
-    apply real NBA tiebreakers (head-to-head, division record, etc.) and
-    doesn't account for play-in games (2020-present). Treat the result as
+    hardcoded conference table (the store's league's -- see CONFERENCES),
+    or league-wide for WNBA seasons from 2016 on, when it stopped seeding
+    by conference. This is NOT official seeding -- it doesn't
+    apply real tiebreakers (head-to-head, division record, etc.) and
+    doesn't account for play-in games (NBA 2020-present). Treat the result as
     a rough "how good was this team relative to its conference" signal,
     not an authoritative seed number. Returns None if the team's
     conference/data can't be determined.
     """
-    conf = "East" if team_abbr in EASTERN_TEAMS else "West" if team_abbr in WESTERN_TEAMS else None
-    if conf is None:
-        return None
-
     reg = store.team_games_for_season(season, "regular")
     if reg.empty or "TEAM_ABBREVIATION" not in reg.columns:
         return None
 
-    conf_teams = EASTERN_TEAMS if conf == "East" else WESTERN_TEAMS
+    if store.league == "WNBA" and season >= WNBA_LEAGUEWIDE_SEEDING_FROM:
+        conf, conf_teams = "League", set(reg["TEAM_ABBREVIATION"])
+    else:
+        conferences = CONFERENCES[store.league]
+        conf = next((c for c, teams in conferences.items() if team_abbr in teams), None)
+        if conf is None:
+            return None
+        conf_teams = conferences[conf]
     conf_games = reg[reg["TEAM_ABBREVIATION"].isin(conf_teams)]
     if conf_games.empty:
         return None

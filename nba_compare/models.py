@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 class PlayerSpan:
     player_id: int
     player_name: str
-    seasons: list[int]          # season START years, e.g. [2015, 2016, 2017] = 2015-16, 2016-17, 2017-18
+    seasons: list[int]          # season START years, e.g. [2015, 2016, 2017] = 2015-16, 2016-17, 2017-18 (WNBA: 2015, 2016, 2017)
     label: str | None = None    # display name, e.g. "LeBron (2015-2018)". Auto-generated if None.
     include_regular: bool = True
     include_playoffs: bool = True
@@ -22,16 +22,18 @@ class PlayerSpan:
     # player(s) count -- one player or a duo (see NBADataStore.games_head_to_head).
     vs_player_ids: tuple[int, ...] = ()
     vs_name: str | None = None
+    # Which league's data this span is read from (see config.LEAGUES).
+    league: str = "NBA"
 
     def __post_init__(self):
         self.seasons = sorted(set(self.seasons))
         if self.label is None:
             if len(self.seasons) == 1:
-                self.label = f"{self.player_name} {_season_str(self.seasons[0])}"
+                self.label = f"{self.player_name} {season_str(self.seasons[0], self.league)}"
             else:
                 self.label = (
                     f"{self.player_name} "
-                    f"{_season_str(self.seasons[0])}\u2013{_season_str(self.seasons[-1])}"
+                    f"{season_str(self.seasons[0], self.league)}\u2013{season_str(self.seasons[-1], self.league)}"
                 )
             if self.vs_name:
                 self.label += f" vs. {self.vs_name}"
@@ -80,15 +82,17 @@ class DuoSpan:
     # Head-to-head, same as PlayerSpan's: only games the duo played against these player(s).
     vs_player_ids: tuple[int, ...] = ()
     vs_name: str | None = None
+    league: str = "NBA"
 
     def __post_init__(self):
         self.seasons = sorted(set(self.seasons))
         if self.label is None:
             if len(self.seasons) == 1:
-                self.label = f"{self.names} {_season_str(self.seasons[0])}"
+                self.label = f"{self.names} {season_str(self.seasons[0], self.league)}"
             else:
                 self.label = (
-                    f"{self.names} {_season_str(self.seasons[0])}–{_season_str(self.seasons[-1])}"
+                    f"{self.names} {season_str(self.seasons[0], self.league)}–"
+                    f"{season_str(self.seasons[-1], self.league)}"
                 )
             if self.vs_name:
                 self.label += f" vs. {self.vs_name}"
@@ -102,5 +106,10 @@ class DuoSpan:
         return f"{self.player_a_name} & {self.player_b_name}"
 
 
-def _season_str(start_year: int) -> str:
+def season_str(start_year: int, league: str = "NBA") -> str:
+    """Display form of a SEASON value. The NBA season straddles two years
+    ("2015-16"); the WNBA plays inside one calendar year, so its SEASON is
+    just that year ("2015")."""
+    if league == "WNBA":
+        return str(start_year)
     return f"{start_year}-{str(start_year + 1)[-2:]}"

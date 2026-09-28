@@ -15,8 +15,9 @@ Two optional environment overrides:
   NBA_COMPARE_DATA_DIR    read the parquet files straight out of this local
                           folder instead of the Hub -- for working offline,
                           or testing a rebuild of the data before it's
-                          pushed. Point it at the NBA Encyclopedia project's
-                          data/ folder to get the old behaviour back.
+                          pushed. It can hold the dataset's nba/ and wnba/
+                          folders, or one league's files loose (the NBA
+                          Encyclopedia project's data/ folder works as-is).
   NBA_COMPARE_HF_REVISION branch, tag, or commit sha to pull instead of
                           "main" -- pin it to a sha if you ever need a run
                           to be reproducible against one version of the data.
@@ -31,20 +32,29 @@ from pathlib import Path
 
 HF_REPO_ID = "BBuckz/basketball-encyclopedia"
 HF_REPO_TYPE = "dataset"
-# The NBA files live under nba/ in the dataset (wnba/ is the other league).
-HF_PATH_PREFIX = "nba"
 DEFAULT_HF_REVISION = "main"
+
+# Every league the dataset carries. Each lives in its own folder (nba/,
+# wnba/) with the same four files under a league-prefixed name, and the
+# same NBA stats API schema -- player, team and game IDs never collide
+# across leagues, so rows from both can sit side by side.
+LEAGUES = ("NBA", "WNBA")
+DEFAULT_LEAGUE = "NBA"
+
+# Regulation game length in minutes -- what pace is normalized to.
+GAME_MINUTES = {"NBA": 48, "WNBA": 40}
 
 LOCAL_DIR_ENV = "NBA_COMPARE_DATA_DIR"
 REVISION_ENV = "NBA_COMPARE_HF_REVISION"
 
-# Logical dataset key -> filename, shared by both sources: the local
-# override folder is expected to use the same names the Hub repo does.
+# Logical dataset key -> filename (with {league} = "nba"/"wnba"), shared by
+# both sources: the local override folder is expected to use the same names
+# the Hub repo does.
 FILENAMES = {
-    "regular": "nba_gamelogs.parquet",
-    "playoffs": "nba_playoffs_gamelogs.parquet",
-    "team_regular": "nba_team_gamelogs.parquet",
-    "team_playoffs": "nba_team_playoffs_gamelogs.parquet",
+    "regular": "{league}_gamelogs.parquet",
+    "playoffs": "{league}_playoffs_gamelogs.parquet",
+    "team_regular": "{league}_team_gamelogs.parquet",
+    "team_playoffs": "{league}_team_playoffs_gamelogs.parquet",
 }
 
 
@@ -58,7 +68,7 @@ def hf_revision() -> str:
     return os.environ.get(REVISION_ENV, "").strip() or DEFAULT_HF_REVISION
 
 
-def resolve(key: str) -> str:
+def resolve(key: str, league: str = DEFAULT_LEAGUE) -> str:
     """
     Local filesystem path for one dataset, downloading it from the Hub on
     first use if it isn't cached yet. Call this lazily -- it's a network
@@ -66,15 +76,21 @@ def resolve(key: str) -> str:
     caching is that a session only ever pays for the files it touches.
     """
     try:
-        filename = FILENAMES[key]
+        filename = FILENAMES[key].format(league=league.lower())
     except KeyError:
         raise KeyError(
             f"unknown dataset {key!r}; expected one of {sorted(FILENAMES)}"
         ) from None
+    if league not in LEAGUES:
+        raise KeyError(f"unknown league {league!r}; expected one of {LEAGUES}")
 
     override = local_data_dir()
     if override is not None:
-        path = override / filename
+        # Either the whole dataset (nba/, wnba/ folders) or, as before, one
+        # league's files sitting loose in the folder.
+        path = override / league.lower() / filename
+        if not path.exists():
+            path = override / filename
         if not path.exists():
             raise FileNotFoundError(
                 f"{LOCAL_DIR_ENV} is set to {override}, but {filename} isn't "
@@ -96,7 +112,7 @@ def resolve(key: str) -> str:
         repo_id=HF_REPO_ID,
         repo_type=HF_REPO_TYPE,
         revision=hf_revision(),
-        filename=f"{HF_PATH_PREFIX}/{filename}",
+        filename=f"{league.lower()}/{filename}",
     )
 
 
@@ -105,4 +121,4 @@ def describe_source() -> str:
     override = local_data_dir()
     if override is not None:
         return f"local folder {override}"
-    return f"hf://datasets/{HF_REPO_ID}@{hf_revision()}/{HF_PATH_PREFIX}"
+    return f"hf://datasets/{HF_REPO_ID}@{hf_revision()}"

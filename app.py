@@ -13,8 +13,11 @@ import uuid
 import streamlit as st
 from streamlit_sortables import sort_items
 
+import pandas as pd
+
 from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans, AccoladeStore
 from nba_compare import config as data_config
+from nba_compare.models import season_str
 from nba_compare.players import search_players
 from nba_compare.table import (
     build_stat_table, build_stat_flags, render_stat_table_html, build_awards_table,
@@ -31,23 +34,41 @@ from nba_compare.playoffs import (
     round_labels_present, build_round_comparison_table,
 )
 
-st.set_page_config(page_title="NBA Compare", layout="wide")
+st.set_page_config(page_title="Basketball Compare", layout="wide")
 
 
 # ---------- cached data access ----------
 
+# "Both" puts every league's players in one search, each row still read
+# from its own league's store.
+LEAGUE_MODES = list(data_config.LEAGUES) + ["Both"]
+
+
 @st.cache_resource
-def get_store_and_directory():
+def get_stores() -> dict[str, NBADataStore]:
+    """One store per league -- see NBADataStore for why they aren't merged.
+    Building them touches no data; each league's files load on first use."""
+    return {league: NBADataStore.from_config(league) for league in data_config.LEAGUES}
+
+
+@st.cache_resource
+def get_league_directory(league: str) -> pd.DataFrame:
     """
-    The store plus the full player directory. Building the directory is what
-    pulls the regular-season game logs, which on a cold start means
-    downloading them from the Hugging Face dataset (see config.py) -- hence
-    the spinner; every run after that is served from the local HF cache.
+    One league's player directory, with a LEAGUE column. Building it is what
+    pulls that league's regular-season game logs, which on a cold start
+    means downloading them from the Hugging Face dataset (see config.py) --
+    hence the spinner; every run after that is served from the local HF
+    cache. Cached per league, so an NBA-only session never downloads WNBA
+    data.
     """
-    store = NBADataStore.from_config()
-    with st.spinner(f"Loading game logs from {data_config.describe_source()}..."):
-        directory = store.all_players("regular")
-    return store, directory
+    with st.spinner(f"Loading {league} game logs from {data_config.describe_source()}..."):
+        return get_stores()[league].all_players("regular").assign(LEAGUE=league)
+
+
+def directory_for(mode: str) -> pd.DataFrame:
+    leagues = data_config.LEAGUES if mode == "Both" else [mode]
+    frames = [get_league_directory(league) for league in leagues]
+    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
 @st.cache_data
@@ -66,7 +87,14 @@ def get_seasons_together(_store, player_a_id: int, player_b_id: int) -> list[int
     return sorted(set(regular) | set(playoffs))
 
 
-store, directory = get_store_and_directory()
+stores = get_stores()
+
+# A loaded save switches league before the picker renders (Streamlit won't
+# let a widget's value be set after it's drawn in the same run).
+if "_pending_league_mode" in st.session_state:
+    st.session_state["league_mode"] = st.session_state.pop("_pending_league_mode")
+if st.session_state.get("league_mode") not in LEAGUE_MODES:
+    st.session_state["league_mode"] = data_config.DEFAULT_LEAGUE
 
 
 # ---------- session state ----------
@@ -93,7 +121,46 @@ def remove_span(span_id: str):
     st.session_state.spans = [s for s in st.session_state.spans if s["id"] != span_id]
 
 
-st.title("NBA Player / Span Comparison")
+league_mode = st.session_state["league_mode"]
+st.title(f"{'NBA / WNBA' if league_mode == 'Both' else league_mode} Player / Span Comparison")
+st.radio(
+    "League", LEAGUE_MODES, key="league_mode", horizontal=True,
+    help="Which league's players to search. **Both** lets an NBA player sit next to a WNBA "
+         "player -- each is still measured against their own league (%ile, relative "
+         "shooting, pace, playoff rounds).",
+)
+directory = directory_for(league_mode)
+
+
+def player_row(player_id: int, directory: pd.DataFrame = directory):
+    """The directory row for this player id, or None if they aren't in it
+    (e.g. a WNBA player picked under "Both", after switching to NBA)."""
+    row = directory[directory.PLAYER_ID == player_id]
+    return None if row.empty else row.iloc[0]
+
+
+def player_option_label(player_id: int) -> str:
+    row = player_row(player_id)
+    if row is None:
+        return str(player_id)
+    return f"{row.PLAYER_NAME} ({row.LEAGUE})" if league_mode == "Both" else row.PLAYER_NAME
+
+
+def league_of(player_id: int, directory: pd.DataFrame = directory) -> str:
+    return player_row(player_id, directory).LEAGUE
+
+
+def seasons_for(player_id: int, directory: pd.DataFrame = directory) -> list[int]:
+    return get_seasons(stores[league_of(player_id, directory)], player_id)
+
+
+def seasons_together_for(player_a_id: int, player_b_id: int, directory: pd.DataFrame = directory) -> list[int]:
+    """[] for players from different leagues -- they were never teammates."""
+    league = league_of(player_a_id, directory)
+    if league != league_of(player_b_id, directory):
+        return []
+    return get_seasons_together(stores[league], player_a_id, player_b_id)
+
 
 # ---------- save / load setup ----------
 # Placed before the span builder loop below, because loading must set each
@@ -113,12 +180,12 @@ def _build_span_dicts_from_session() -> list[dict]:
         match_key, range_key = f"match_{sid}", f"range_{sid}"
         if match_key not in st.session_state or range_key not in st.session_state:
             continue
-        name = st.session_state[match_key]
-        row = directory[directory.PLAYER_NAME == name]
-        if row.empty:
+        player_id = st.session_state[match_key]
+        row = player_row(player_id)
+        if row is None:
             continue
-        player_id = int(row.iloc[0].PLAYER_ID)
-        seasons_played = get_seasons(store, player_id)
+        name = row.PLAYER_NAME
+        seasons_played = seasons_for(player_id)
         lo, hi = st.session_state[range_key]
         season_list = [s for s in seasons_played if lo <= s <= hi]
         if not season_list:
@@ -144,15 +211,12 @@ def _build_duo_dicts_from_session() -> list[dict]:
         matcha_key, matchb_key, range_key = f"matcha_{sid}", f"matchb_{sid}", f"range_duo_{sid}"
         if matcha_key not in st.session_state or matchb_key not in st.session_state or range_key not in st.session_state:
             continue
-        name_a, name_b = st.session_state[matcha_key], st.session_state[matchb_key]
-        row_a = directory[directory.PLAYER_NAME == name_a]
-        row_b = directory[directory.PLAYER_NAME == name_b]
-        if row_a.empty or row_b.empty:
+        player_a_id, player_b_id = st.session_state[matcha_key], st.session_state[matchb_key]
+        row_a, row_b = player_row(player_a_id), player_row(player_b_id)
+        if row_a is None or row_b is None or player_a_id == player_b_id:
             continue
-        player_a_id, player_b_id = int(row_a.iloc[0].PLAYER_ID), int(row_b.iloc[0].PLAYER_ID)
-        if player_a_id == player_b_id:
-            continue
-        overlap = get_seasons_together(store, player_a_id, player_b_id)
+        name_a, name_b = row_a.PLAYER_NAME, row_b.PLAYER_NAME
+        overlap = seasons_together_for(player_a_id, player_b_id)
         lo, hi = st.session_state[range_key]
         season_list = [s for s in overlap if lo <= s <= hi]
         if not season_list:
@@ -181,6 +245,7 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             accolade_path=st.session_state.get("accolade_path_input", "") or "",
             user_presets=st.session_state.get("user_presets", []),
             head_to_head=st.session_state.get("h2h_mode", False),
+            league_mode=league_mode,
         )
         st.session_state["_last_save_code"] = code
     if st.session_state.get("_last_save_code"):
@@ -202,17 +267,19 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
         except ConfigError as e:
             st.error(str(e))
         else:
+            # Players are looked up in the SAVED league's directory -- the
+            # league picker switches to it on the rerun below.
+            load_dir = directory_for(cfg["league_mode"])
             skipped_players, new_span_cfgs = [], []
             for s in cfg["spans"]:
-                match = directory[directory.PLAYER_ID == s["player_id"]]
-                if match.empty:
+                match = player_row(s["player_id"], load_dir)
+                if match is None:
                     skipped_players.append(s.get("player_name") or f"player id {s['player_id']}")
                     continue
-                canonical_name = match.iloc[0].PLAYER_NAME
                 new_sid = str(uuid.uuid4())
-                st.session_state[f"q_{new_sid}"] = canonical_name
-                st.session_state[f"match_{new_sid}"] = canonical_name
-                seasons_played = get_seasons(store, s["player_id"])
+                st.session_state[f"q_{new_sid}"] = match.PLAYER_NAME
+                st.session_state[f"match_{new_sid}"] = s["player_id"]
+                seasons_played = seasons_for(s["player_id"], load_dir)
                 valid_seasons = [yr for yr in s["seasons"] if yr in seasons_played] or seasons_played
                 st.session_state.setdefault("_pending_ranges", {})[new_sid] = (min(valid_seasons), max(valid_seasons))
                 st.session_state[f"reg_{new_sid}"] = s["include_regular"]
@@ -222,20 +289,19 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
 
             skipped_duos = []
             for d in cfg["duos"]:
-                match_a = directory[directory.PLAYER_ID == d["player_a_id"]]
-                match_b = directory[directory.PLAYER_ID == d["player_b_id"]]
-                if match_a.empty or match_b.empty:
+                match_a = player_row(d["player_a_id"], load_dir)
+                match_b = player_row(d["player_b_id"], load_dir)
+                if match_a is None or match_b is None:
                     label = d.get("label") or f"{d.get('player_a_name', '?')} & {d.get('player_b_name', '?')}"
                     skipped_duos.append(label)
                     continue
-                name_a, name_b = match_a.iloc[0].PLAYER_NAME, match_b.iloc[0].PLAYER_NAME
                 new_sid = str(uuid.uuid4())
                 st.session_state[f"mode_{new_sid}"] = "Duo"
-                st.session_state[f"qa_{new_sid}"] = name_a
-                st.session_state[f"matcha_{new_sid}"] = name_a
-                st.session_state[f"qb_{new_sid}"] = name_b
-                st.session_state[f"matchb_{new_sid}"] = name_b
-                overlap = get_seasons_together(store, d["player_a_id"], d["player_b_id"])
+                st.session_state[f"qa_{new_sid}"] = match_a.PLAYER_NAME
+                st.session_state[f"matcha_{new_sid}"] = d["player_a_id"]
+                st.session_state[f"qb_{new_sid}"] = match_b.PLAYER_NAME
+                st.session_state[f"matchb_{new_sid}"] = d["player_b_id"]
+                overlap = seasons_together_for(d["player_a_id"], d["player_b_id"], load_dir)
                 valid_seasons = [yr for yr in d["seasons"] if yr in overlap] or overlap
                 if valid_seasons:
                     st.session_state.setdefault("_pending_ranges", {})[new_sid] = (
@@ -288,6 +354,7 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             if cfg["accolade_path"]:
                 st.session_state["accolade_path_input"] = cfg["accolade_path"]
             st.session_state["h2h_mode"] = cfg["head_to_head"]
+            st.session_state["_pending_league_mode"] = cfg["league_mode"]
 
             msg = f"Loaded {len(new_span_cfgs)} span(s)."
             if skipped_players:
@@ -410,17 +477,17 @@ for cfg in st.session_state.spans:
             player_id = None
             player_name = None
             if not matches.empty:
-                options = {f"{row.PLAYER_NAME}": row.PLAYER_ID for row in matches.itertuples()}
-                chosen = cols[0].selectbox(
-                    "Match", list(options.keys()), key=f"match_{sid}", label_visibility="collapsed"
+                player_id = cols[0].selectbox(
+                    "Match", [int(pid) for pid in matches.PLAYER_ID], key=f"match_{sid}",
+                    format_func=player_option_label, label_visibility="collapsed",
                 )
-                player_id = int(options[chosen])
-                player_name = chosen
+                player_name = player_row(player_id).PLAYER_NAME
+                league = league_of(player_id)
             elif query:
                 cols[0].caption("No matches")
 
             if player_id is not None:
-                seasons = get_seasons(store, player_id)
+                seasons = seasons_for(player_id)
                 if seasons:
                     # select_slider needs an explicit value= on first render to
                     # know it's a RANGE slider at all -- pre-seeding its session
@@ -435,7 +502,7 @@ for cfg in st.session_state.spans:
                         options=seasons,
                         value=default_range,
                         key=f"range_{sid}",
-                        format_func=lambda y: f"{y}-{str(y + 1)[-2:]}",
+                        format_func=lambda y, league=league: season_str(y, league),
                     )
                     season_list = [s for s in seasons if lo <= s <= hi]
                 else:
@@ -460,6 +527,7 @@ for cfg in st.session_state.spans:
                             label=label or None,
                             include_regular=include_reg,
                             include_playoffs=include_po,
+                            league=league,
                         )
                     )
 
@@ -474,12 +542,11 @@ for cfg in st.session_state.spans:
             matches_a = search_players(query_a, directory)
             player_a_id = player_a_name = None
             if not matches_a.empty:
-                options_a = {row.PLAYER_NAME: row.PLAYER_ID for row in matches_a.itertuples()}
-                chosen_a = cols[0].selectbox(
-                    "Match A", list(options_a.keys()), key=f"matcha_{sid}", label_visibility="collapsed"
+                player_a_id = cols[0].selectbox(
+                    "Match A", [int(pid) for pid in matches_a.PLAYER_ID], key=f"matcha_{sid}",
+                    format_func=player_option_label, label_visibility="collapsed",
                 )
-                player_a_id = int(options_a[chosen_a])
-                player_a_name = chosen_a
+                player_a_name = player_row(player_a_id).PLAYER_NAME
             elif query_a:
                 cols[0].caption("No matches")
 
@@ -487,20 +554,22 @@ for cfg in st.session_state.spans:
             matches_b = search_players(query_b, directory)
             player_b_id = player_b_name = None
             if not matches_b.empty:
-                options_b = {row.PLAYER_NAME: row.PLAYER_ID for row in matches_b.itertuples()}
-                chosen_b = cols[1].selectbox(
-                    "Match B", list(options_b.keys()), key=f"matchb_{sid}", label_visibility="collapsed"
+                player_b_id = cols[1].selectbox(
+                    "Match B", [int(pid) for pid in matches_b.PLAYER_ID], key=f"matchb_{sid}",
+                    format_func=player_option_label, label_visibility="collapsed",
                 )
-                player_b_id = int(options_b[chosen_b])
-                player_b_name = chosen_b
+                player_b_name = player_row(player_b_id).PLAYER_NAME
             elif query_b:
                 cols[1].caption("No matches")
 
             if player_a_id is not None and player_b_id is not None:
                 if player_a_id == player_b_id:
                     cols[2].caption("Pick two different players")
+                elif league_of(player_a_id) != league_of(player_b_id):
+                    cols[2].caption("Different leagues -- never teammates")
                 else:
-                    overlap = get_seasons_together(store, player_a_id, player_b_id)
+                    league = league_of(player_a_id)
+                    overlap = seasons_together_for(player_a_id, player_b_id)
                     if not overlap:
                         cols[2].caption("Never teammates")
                     else:
@@ -511,7 +580,7 @@ for cfg in st.session_state.spans:
                             options=overlap,
                             value=default_range,
                             key=f"range_duo_{sid}",
-                            format_func=lambda y: f"{y}-{str(y + 1)[-2:]}",
+                            format_func=lambda y, league=league: season_str(y, league),
                         )
                         season_list = [s for s in overlap if lo <= s <= hi]
 
@@ -535,6 +604,7 @@ for cfg in st.session_state.spans:
                                     label=label or None,
                                     include_regular=include_reg,
                                     include_playoffs=include_po,
+                                    league=league,
                                 )
                             )
 
@@ -555,6 +625,11 @@ if head_to_head:
         st.warning(
             f"Head-to-head compares exactly two rows (players or duos) -- you have {len(valid_spans)}. "
             "Showing the normal comparison instead."
+        )
+    elif valid_spans[0].league != valid_spans[1].league:
+        st.warning(
+            "Head-to-head needs both rows from the same league -- an NBA and a WNBA player "
+            "never played each other. Showing the normal comparison instead."
         )
     elif set(valid_spans[0].player_ids) & set(valid_spans[1].player_ids):
         st.warning(
@@ -712,7 +787,7 @@ else:
             cols[1].button("✕", key=f"del_user_preset_{p['name']}",
                            on_click=_delete_user_preset, args=(p["name"],))
 
-    result = compare_spans(valid_spans, store)
+    result = compare_spans(valid_spans, stores)
     has_regular = any(agg["regular"] for agg in result.aggregates)
     has_playoffs = any(agg["playoffs"] for agg in result.aggregates)
     formats, lower_is_better = formats_and_lower_is_better(combined_stat_defs)
@@ -742,7 +817,7 @@ else:
                 "**/100** = per 100 team possessions the player was on the floor for, using that "
                 "team's own measured pace over these exact games — the pace-aware counterpart to "
                 "/36, which can't tell a 100-possession game from an 85-possession one. Possessions "
-                "come out of the team box score, so these rows are blank for seasons before 1977: "
+                "come out of the team box score, so these rows are blank for NBA seasons before 1977: "
                 "turnovers weren't recorded, and without them there's no possession estimate to make."
             )
         if any(lbl.endswith("/75") for lbl in stat_labels):
@@ -756,7 +831,16 @@ else:
             st.caption(
                 "**Team/Opp …/G** = the player's team's and its opponents' box score, per game, over "
                 "the games in this span. Each is averaged over the games that have it recorded; "
-                "before 1985 most columns are rebuilt from player logs where possible (marked *)."
+                "before 1985 (NBA) most columns are rebuilt from player logs where possible, as are "
+                "WNBA team turnovers in 1997, 2000 and 2003 (marked *)."
+            )
+        if len({s.league for s in valid_spans}) > 1:
+            st.caption(
+                "**NBA and WNBA side by side**: each row is measured against its own league -- %ile "
+                "and relative shooting rank a WNBA season among WNBA players, and pace counts "
+                "possessions per 48 minutes in the NBA but per 40 in the WNBA. Raw counting stats "
+                "are straight comparisons, but WNBA games are 8 minutes shorter, so per-game "
+                "numbers favor the NBA; /36 and /100 even that out."
             )
         if any(lbl.endswith("CV%") for lbl in stat_labels):
             st.caption(
@@ -775,7 +859,7 @@ else:
             )
         if any(lbl.endswith("%ile") for lbl in stat_labels):
             st.caption(
-                "%ile = where this stat ranks among qualifying players **in that same season** "
+                "%ile = where this stat ranks among qualifying players **in that same season and league** "
                 "(min. 10 games regular season, 1 game playoffs) -- 90 means better than ~90% of the "
                 "league that year. A span covering multiple seasons shows a games-weighted average "
                 "across those seasons. Turnovers are inverted so higher %ile always means better, "
@@ -794,9 +878,11 @@ else:
                 "season's actual deepest round league-wide (not a hardcoded round count), so it stays "
                 "correct across playoff formats with different numbers of rounds. "
                 "**Home Court** is exact -- it's just whoever hosted Game 1. "
-                "**Seed is an approximation** (regular-season win% rank within conference) -- it doesn't "
+                "**Seed is an approximation** (regular-season win% rank within conference -- league-wide "
+                "for WNBA seasons from 2016, when it stopped seeding by conference) -- it doesn't "
                 "apply real tiebreakers or account for play-in games, so treat it as a rough signal, not "
-                "an official seed."
+                "an official seed. Rounds are numbered league-wide, so a team coming off a bye "
+                "starts in the round it actually entered."
             )
 
             series_available_labels = list(SERIES_COLUMN_DEFS.keys())

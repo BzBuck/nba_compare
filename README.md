@@ -1,8 +1,11 @@
 # nba_compare
 
-Compares NBA players across arbitrary time spans — full careers, single
-seasons, or custom ranges — including regular season and playoff stats,
-usage, team context, and game-to-game consistency, side by side.
+Compares NBA and WNBA players across arbitrary time spans — full careers,
+single seasons, or custom ranges — including regular season and playoff
+stats, usage, per-possession rates, team context, and game-to-game
+consistency, side by side. Rows can be single players or teammate duos,
+restricted to the games two sides played against each other, and drawn
+from either league or both at once.
 
 The core idea: the unit being compared is a **span** (one player + one set
 of seasons), not a "player." That's what lets you compare two different
@@ -20,9 +23,9 @@ That's the whole setup — there's no data to download by hand.
 
 ## Where the data comes from
 
-The four parquet game-log files are pulled from the Hugging Face dataset
+Four parquet game-log files per league are pulled from the Hugging Face dataset
 [BBuckz/basketball-encyclopedia](https://huggingface.co/datasets/BBuckz/basketball-encyclopedia),
-from its `nba/` folder:
+from its `nba/` and `wnba/` folders (same schema, `wnba_` prefix):
 
 | logical name    | file                                 |
 |-----------------|--------------------------------------|
@@ -36,11 +39,28 @@ Hugging Face cache (`~/.cache/huggingface`, or wherever `HF_HOME` points),
 so only the first run of a fresh machine waits on the network — and once a
 file is cached, it loads even with no connection. The download is lazy per
 file, not all four up front: a comparison that never opens the playoff tabs
-never fetches the playoff logs. `NBADataStore.from_config()` itself does no
+never fetches the playoff logs, and a session that never picks WNBA (or
+Both) never fetches any WNBA file. `NBADataStore.from_config()` itself does no
 I/O at all.
 
 To publish new data, push it to the dataset repo; clients pick it up on
 their next cold start. Nothing in this project needs to change.
+
+### NBA, WNBA, or both
+
+The **League** picker at the top of the app searches NBA players, WNBA
+players, or both at once — so an NBA player can sit in the same table as a
+WNBA player. Each league gets its own `NBADataStore`
+(`NBADataStore.from_config("WNBA")`), and `compare_spans(spans, {"NBA": ...,
+"WNBA": ...})` reads every span from its own league's store. That matters
+because everything league-wide is keyed by season: percentiles, relative
+shooting, standings and playoff structure for a WNBA row are measured
+against the WNBA only. Pace is per 48 minutes in the NBA and per 40 in the
+WNBA; per-game numbers aren't adjusted, so compare /36 or /100 across
+leagues.
+
+Two WNBA data gaps (team minutes and team turnovers recorded as `0` in the
+early seasons) are repaired on load — see "Per 100 possessions" below.
 
 ### Overriding the source
 
@@ -49,7 +69,8 @@ Both of these are optional environment variables, read by
 
 ```bash
 # read the parquet files out of a local folder instead of the Hub --
-# offline work, or testing a rebuild before it's pushed
+# offline work, or testing a rebuild before it's pushed. The folder can hold
+# nba/ and wnba/ subfolders, or one league's files loose.
 export NBA_COMPARE_DATA_DIR="../NBA Encyclopedia/data"
 
 # pull a branch, tag, or commit sha other than main -- pin a sha when a
@@ -67,6 +88,9 @@ only needed if the dataset is ever made private.
 streamlit run app.py
 ```
 
+- **League picker** (NBA / WNBA / Both) at the top — which league's players
+  the search covers. **Both** lets an NBA and a WNBA player share a table;
+  see "NBA, WNBA, or both" above.
 - **Search and add players** by typing part of a name; add as many
   player+span rows as you want, including multiple spans of the same
   player (e.g. "prime LeBron" vs. "current LeBron"). **Drag to reorder**
@@ -80,21 +104,31 @@ streamlit run app.py
   added up. A game only counts if both players logged real minutes in it
   (see "Duo mode" below for exactly what that means and how it interacts
   with usage%, playoff series records, and awards).
+- **Head-to-head toggle**: with exactly two rows (players or duos), only
+  count the games the two sides played *against* each other — both columns
+  are built from the same games, and W/L becomes the head-to-head record.
+  See "Head-to-head" below.
 - **Season range slider** per span (single season, a few years, or full
   career), plus independent toggles for regular season / playoffs.
+- **Stat presets**: one click swaps the table to a themed set of rows —
+  Traditional, Totals, Per 36, Era-adjusted, Efficiency, Advanced, Team
+  impact, Playoff résumé, Consistency — and you can save your own current
+  selection as a preset. See "Stat presets" below.
 - **Customize stats shown**: pick exactly which stats appear from the full
-  catalog below (box score, usage, team context, consistency, your own
-  custom formulas), then **drag to reorder** them.
+  catalog below (box score, per-100, usage, team and opponent box scores,
+  consistency, percentiles, your own custom formulas), then **drag to
+  reorder** them.
 - **Custom stat formulas**: sidebar form to define your own stat as a
   formula over existing ones, using the exact stat labels shown in the
-  table — e.g. `PTS/G / USG Vol/G` for points per used possession. See
-  "Custom formulas" below for the full variable list and what's actually
-  allowed in an expression.
+  table — e.g. `PTS/G / USG Vol/G` for points per used possession — with
+  its own decimal places and a "lower is better" flag for highlighting.
+  See "Custom formulas" below for the full variable list and what's
+  actually allowed in an expression.
 - **Save / Load setup**: sidebar section to save your current players
-  and duos, seasons, and stat selection as a code (or file) you can paste
-  back in later, in a different session, after the app's code has
-  changed. See "Save / Load" below for why this is safe against future
-  edits.
+  and duos, seasons, league, head-to-head setting, stat selection, custom
+  formulas and saved presets as a code (or file) you can paste back in
+  later, in a different session, after the app's code has changed. See
+  "Save / Load" below for why this is safe against future edits.
 - **Playoff series breakdown**: expander below the tables with two views —
   **Round-by-round comparison** (rows=stats, columns=spans, best value
   highlighted — same visual style as the main box score table, one
@@ -111,8 +145,10 @@ per span, best value in each row highlighted green and (with 3+ columns
 being compared) worst highlighted red — split into separate Regular
 Season and Playoffs tables. With exactly 2 columns, worst is never
 highlighted, since it'd just be "not green" shown louder; ties at either
-extreme aren't highlighted either. An Awards & Honors table appears too,
-if you point the sidebar at an accolades CSV (see `accolades.py`).
+extreme aren't highlighted either. Short explanatory notes appear under the
+tables for whichever stat families are showing (/100, /75, CV%, %ile,
+Team/Opp, head-to-head, mixed leagues). An Awards & Honors table appears
+too, if you point the sidebar at an accolades CSV (see `accolades.py`).
 
 ## Quick test (no UI)
 
@@ -133,10 +169,11 @@ data comes from"), not in a sibling folder.
 nba_compare/                        <- project root, cd here to work
     ├── nba_compare/                <- the importable package
     │   ├── __init__.py
-    │   ├── models.py                PlayerSpan
+    │   ├── models.py                PlayerSpan, DuoSpan
     │   ├── data.py                  NBADataStore -- loads/joins parquet
     │   ├── compare.py               stat computation + N-way comparison
     │   ├── table.py                 Stathead-style table + stat catalog
+    │   ├── presets.py               built-in stat presets + their formulas
     │   ├── playoffs.py              series/round/championship identification
     │   ├── percentiles.py           league percentile ranks per season
     │   ├── formulas.py              safe evaluator for custom formulas
@@ -144,7 +181,7 @@ nba_compare/                        <- project root, cd here to work
     │   ├── players.py               player search helper for the UI
     │   ├── accolades.py             pluggable Awards & Honors source
     │   ├── viz.py                   Plotly charts (library-level, see below)
-    │   └── config.py                where the parquet files come from
+    │   └── config.py                where the parquet files come from, per league
     ├── app.py                       Streamlit UI, run this
     ├── smoke_test.py                quick end-to-end check
     ├── requirements.txt
@@ -180,12 +217,20 @@ the era limits.
 **Usage** — •USG%, •USG Vol/G (raw plays used per game, not a %), MIN%
 (share of the team's total floor time this player occupied)
 
-**Team context** — Team PTS/G, Team Poss/G, Team Pace (real two-team pace
+**Team context** — Team Poss/G, Team Pace (real two-team pace
 formula, not a single-team estimate — see below), Team ORtg, Team DRtg,
 Net Rtg (ORtg − DRtg), Team MOV (plain, un-pace-adjusted average scoring
 margin), Team W%, Avg Seed (approx) (regular-season-only average of the
 same approximate conference seed used in the playoff series breakdown —
 see "Playoff depth & series" below for its caveats)
+
+**Team & opponent box score** — Team MIN/G, then the full box line per game
+for the player's team and its opponents over the span's games: Team/Opp
+PTS/G, TRB/G, ORB/G, DRB/G, AST/G, STL/G, BLK/G, TOV/G, PF/G, FGM/G, FGA/G,
+3PM/G, 3PA/G, FTM/G, FTA/G. Labeled like the player's own rows ("Team AST/G"
+next to "AST/G") so formulas such as AST% read the way Basketball-Reference
+writes them. Each is averaged over the games that have it recorded; a column
+rebuilt from player logs gets its own `*`.
 
 **Consistency** — MIN/PTS/TRB/AST/STL/BLK/TOV/3PM/FGM/FTM/TSA/Usage
 Vol/TS% CV% (coefficient of variation — see below), plus
@@ -199,6 +244,9 @@ aggregates — see "Playoff depth & series" below for how these are derived)
 
 **League percentiles** — PTS/TRB/AST/STL/BLK/TOV/FG%/3P%/FT%/eFG%/TS% %ile
 (see "League percentiles" below)
+
+Presets add more rows on top of these — /36, /75, totals, AST%, TRB%, GmSc
+and so on — as formulas rather than built-ins; see "Stat presets" below.
 
 ### What CV% actually means
 
@@ -244,7 +292,8 @@ player_poss = player_MIN × team_poss / (team_MIN / 5)
 per_100     = 100 × stat / player_poss
 ```
 
-`team_MIN / 5` converts the team's ~240 player-minutes into minutes of game
+`team_MIN / 5` converts the team's player-minutes (~240 in the NBA, ~200 in
+the WNBA) into minutes of game
 clock, so `team_poss / (team_MIN/5)` is possessions per minute of game clock
 — **this team's own measured pace over these exact games**, not a league
 constant and not an era assumption. The one assumption is that the team ran
@@ -274,9 +323,19 @@ overtime games pass automatically).
 
 | Seasons | Source | Marked |
 |---|---|---|
-| 1985– | official team box scores | no |
-| 1977–1984 | rebuilt from summed player rows | `*` |
-| –1976 | not computable at all | shows `—` |
+| NBA 1985– | official team box scores | no |
+| NBA 1977–1984 | rebuilt from summed player rows | `*` |
+| NBA –1976 | not computable at all | shows `—` |
+| WNBA 1997, 2000, 2003 | team turnovers rebuilt from summed player rows | `*` |
+| WNBA, every other season | official team box scores | no |
+
+The WNBA team logs record team turnovers as `0` for every game of 1997, 2000
+and 2003; since no team plays a turnover-free game, those zeros are treated
+as missing and rebuilt like the NBA's gaps. The WNBA team logs also carry
+team minutes of `0` for 1997–2003 (scrambled through 2004); those are
+replaced by the players' summed minutes where they add up to a full game —
+see `data._repair_team_lines`. Without that, USG%, per-100 and pace would
+divide by zero for the league's first seasons.
 
 Anything resting on a rebuilt line gets a **`*`** next to it in the table, with
 a footnote. Two reasons it's a caveat and not just a footnote of pedantry:
@@ -310,11 +369,11 @@ points ÷ team possessions; DRtg = 100 × opponent points ÷ opponent
 possessions (needs the actual opposing team's box score for that game,
 joined by `GAME_ID`). Possessions use the standard single-team estimate
 (FGA − OREB + TOV + .44·FTA) applied to each side separately. Pace uses
-the standard NBA formula — both sides' possessions, normalized to a
-48-minute game via the team's actual minutes played (accounting for
-overtime): `48 × ((team_poss + opp_poss) / (2 × (team_MIN / 5)))`. This
-needed team minutes, which wasn't wired into anything until it got added
-alongside player MIN/G.
+the standard formula — both sides' possessions, normalized to one
+regulation game via the team's actual minutes played (accounting for
+overtime): `G × ((team_poss + opp_poss) / (2 × (team_MIN / 5)))`, where
+`G` is 48 in the NBA and 40 in the WNBA (`config.GAME_MINUTES`), so each
+league's pace reads on its own familiar scale.
 
 These used to come back blank for every season before 1985, since the team
 logs have no possession columns that far back. They now fill in for roughly
@@ -340,8 +399,18 @@ championships are all inferred from the game logs themselves:
   team never faces two different playoff opponents interleaved within one
   postseason, so this reliably separates series without needing an
   explicit round/series ID.
-- **Round number** = that team's Nth series chronologically that
-  postseason. Correct regardless of how many rounds existed that era.
+- **Round number** is the *league* round, not just the team's Nth series:
+  walking the postseason's series in the order they start, each one is one
+  round past the latest round either team has already played
+  (`playoffs._league_rounds`). The two only differ when there are byes — a
+  top seed skipping straight to the semifinals (NBA 1950s–60s and 1975–83,
+  WNBA 2016–21) plays its first series in round 3, not round 1. Counting per
+  team used to leave those seasons with no champion detected at all.
+- **Round labels**: NBA seasons with 4 rounds use First Round / Conf Semis /
+  Conf Finals / Finals; other NBA formats use Round N / Finals. WNBA rounds
+  are named back from the Finals (Finals, Semifinals, then First/Second
+  Round), since the WNBA has run 2 to 4 rounds and has had no conference
+  rounds since 2016.
 - **Championship detection does NOT hardcode "round 4 = Finals."** It
   looks at *every* team's playoff series that season (from the team-level
   parquet) to find the actual deepest round reached league-wide that
@@ -351,11 +420,14 @@ championships are all inferred from the game logs themselves:
   rounds "Round 1"/"Finals" (not the standard 4-round names) and only
   flagged the true championship series, not an earlier round win.
 - **Seed is a clearly-flagged APPROXIMATION**, not real seeding: it ranks
-  teams by regular-season win% within a hardcoded conference table
-  (`playoffs.EASTERN_TEAMS`/`WESTERN_TEAMS`). It does **not** apply real
-  NBA tiebreakers (head-to-head, division record, etc.) and doesn't
-  account for play-in games (2020–present). Treat it as a rough "how good
-  was this team" signal, not an authoritative seed number.
+  teams by regular-season win% within a hardcoded conference table, one
+  per league (`playoffs.CONFERENCES` — the leagues share abbreviations like
+  CHA, MIA and SEA for different teams). WNBA seasons from 2016 on are
+  ranked league-wide, since the WNBA stopped seeding by conference. It
+  does **not** apply real tiebreakers (head-to-head, division record,
+  etc.) and doesn't account for NBA play-in games (2020–present). Treat it
+  as a rough "how good was this team" signal, not an authoritative seed
+  number.
 - **Home Court is exact, not an approximation** — whoever hosted Game 1
   of a series had home court advantage for the whole series, by
   definition. That's read straight from the same `MATCHUP` field already
@@ -409,7 +481,7 @@ championships are all inferred from the game logs themselves:
 ### League percentiles
 
 Where a player's per-game value for a stat ranks among every qualifying
-player in the league **that same season** — computed per season, never
+player in **their own league, that same season** — computed per season, never
 pooled across a span, since league context (pace, 3-point rate) shifts
 year to year. A span covering multiple seasons shows a games-weighted
 average of that season's percentile; seasons where the player didn't meet
@@ -490,9 +562,77 @@ added up.
 - **Playoff series GP/W/L** reflect the duo's own combined record over
   games they shared, not the team's full series record — see "Duo spans
   use each half's own W/L" under "Playoff depth & series" above.
+- **Both players must be from the same league** — a cross-league pair
+  shows "Different leagues -- never teammates" in Both mode.
 - **Awards & Honors** are season-level data, not game-level, so a Duo's
   row is simply both players' individual awards summed over the span's
   seasons — not scoped to games they shared the way every other stat here is.
+
+## Head-to-head
+
+Turn on **Head-to-head** with exactly two rows (each a player or a duo) and
+both columns are rebuilt from only the games the two sides played against
+each other.
+
+- **What counts as a meeting**: every player in both rows logged at least
+  10 minutes (`data.H2H_MIN_MINUTES`), with the two rows on opposite teams.
+  A duo only counts in games where both of its players qualified — the same
+  rule as Duo mode.
+- **Same games on both sides**: both rows use only the seasons *both* of
+  their ranges cover, so neither column can include a meeting the other
+  leaves out. W/L over those games is the head-to-head record.
+- **Labels**: an auto label is rebuilt for the shared seasons and gains
+  "vs. <opponent>"; a label you typed stays as typed.
+- **Percentile rows show —** here: they rank whole seasons against the
+  league and don't describe these particular games.
+- **Playoff series** list only the series the two sides met in, with W/L
+  from those games — the team's other series that postseason would
+  otherwise show up as "(DNP)".
+- Needs two rows with no player in common, from the same league — the app
+  explains and falls back to the normal comparison otherwise.
+
+## Stat presets
+
+The **Stat presets** pills above the table swap the rows to a themed set in
+one click:
+
+| Preset | What it shows |
+|---|---|
+| Traditional | the default box score + shooting + usage rows |
+| Totals | season-span totals (PTS, TRB, AST, … = per game × GP) |
+| Per 36 | every counting stat per 36 minutes |
+| Era-adjusted | Poss/G, Team Pace, /75 rates, relative shooting, USG%, %iles |
+| Efficiency | shooting splits, 2P%, e3P%, 3PAr, FTr, points-share by shot type, AST/TOV, TOV% |
+| Advanced | Basketball-Reference style PTS%/ORB%/DRB%/TRB%/AST%/STL%/BLK%/TOV%, USG%, MIN%, GmSc, PANTS |
+| Team impact | Team W%, MOV, ORtg/DRtg/Net, Pace, Team/Opp PTS/G, +/-, MIN%, Avg Seed |
+| Playoff résumé | championships, Finals apps, series W/L, best round, missed series |
+| Consistency | every Floor (P10) and CV% row, plus +/- Std Dev |
+
+The rows a preset needs that aren't built-in stats (Totals, /36, /75, 2P%,
+AST%, GmSc, …) are **custom formulas over the existing stats**, defined in
+`presets.PRESET_FORMULAS` — kept as formulas rather than built-ins so they
+don't crowd the variable list every custom formula is written against.
+Picking a preset adds the formulas it needs (listed in the sidebar under
+"Added by preset") and switching to another removes them again; formulas you
+added yourself are never touched. The pill stays highlighted while the rows
+match a preset exactly, and clears once you edit them by hand.
+
+A few of the formulas worth knowing:
+
+- **/75** = the /100 rate × 0.75 — the same pace adjustment, at roughly a
+  starter's per-game possession count.
+- **AST%, ORB%, DRB%, TRB%, STL%, BLK%, PTS%** = the player's share of what
+  was available while on the floor, using the Team/Opp box score rows and
+  the player's share of team floor time (`(Team MIN/G / 5) / MIN/G`).
+- **e3P%** = 3P% × 1.5 (a made three on the same footing as eFG%).
+- **PANTS** = PTS/G − TSA/G, points beyond one per true shot attempt.
+- **GmSc** = Hollinger's Game Score from per-game averages.
+
+**Your own presets**: under "Customize stats shown", name the current rows
+and **Save preset** — it keeps the rows in order plus the formulas behind
+any of them, so it rebuilds them even in a session that doesn't have them.
+Saving under an existing name updates it, a built-in name is refused, and
+saved presets travel in your save code.
 
 ## Custom formulas
 
@@ -519,13 +659,19 @@ mapping to maintain. Custom formulas can only reference built-in stats,
 not each other, which sidesteps chaining/self-reference/evaluation-order
 issues entirely.
 
+Each formula carries its own display format (0–3 decimal places) and a
+**Lower is better** flag, so a formula like a turnover rate highlights its
+lowest value as the best.
+
 ## Save / Load
 
 Sidebar → "Save / Load setup" → **Generate save code** produces a compact
 text blob (or downloadable file) capturing your players and duos,
-seasons, stat selection/order, and custom formulas. Paste it back in —
-in the same session or a completely different one — and **Load setup**
-rebuilds everything.
+seasons, league (NBA / WNBA / Both), head-to-head setting, stat
+selection/order, custom formulas (with their decimals and lower-is-better
+flag), saved presets, and accolades path. Paste it back in — in the same
+session or a completely different one — and **Load setup** rebuilds
+everything, switching the league picker to the one the save was made in.
 
 This is designed to survive future edits to the code, not just work today:
 
@@ -537,14 +683,18 @@ This is designed to survive future edits to the code, not just work today:
 - Stats and custom formulas are re-validated against the *current* code
   before being applied. If a stat gets renamed/removed, or a formula
   references a variable that no longer exists, it's silently dropped (and
-  reported to you) instead of crashing the whole load.
+  reported to you) instead of crashing the whole load. Saved presets get
+  the same check, and one left with no valid rows is dropped.
+- The format is versioned (`session_config.CONFIG_VERSION`, currently 3).
+  Older saves load unchanged: a save from before league support loads as
+  NBA.
 
 ## Using it as a library (outside the app)
 
 ```python
 from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans, viz
 
-store = NBADataStore.from_config()
+store = NBADataStore.from_config()          # NBA by default; from_config("WNBA") for the WNBA
 
 spans = [
     PlayerSpan.range(201939, "Stephen Curry", 2015, 2016, label="Curry 2015-16 & 2016-17"),
@@ -562,6 +712,23 @@ result.long_table()                       # tidy format for custom plotting
 viz.grouped_bar(result, stats=["PTS", "AST", "REB"], season_type="regular").show()
 viz.radar(result, stats=["PTS", "AST", "REB", "STL", "BLK"]).show()
 ```
+
+To mix leagues, give each span its `league` and pass one store per league —
+each span is then read from its own league's store:
+
+```python
+stores = {"NBA": NBADataStore.from_config("NBA"), "WNBA": NBADataStore.from_config("WNBA")}
+spans = [
+    PlayerSpan(2544, "LeBron James", [2012], league="NBA"),
+    PlayerSpan(1628932, "A'ja Wilson", [2024], league="WNBA"),
+]
+result = compare_spans(spans, stores)
+```
+
+Head-to-head is the same span with `vs_player_ids` (and optionally
+`vs_name`) set — `PlayerSpan(201939, "Stephen Curry", range(2014, 2019),
+vs_player_ids=(2544,), vs_name="LeBron James")` — and works for a `DuoSpan`
+too.
 
 `viz.py`'s Plotly charts and `ComparisonResult`'s `summary()`/
 `wide_table()`/`long_table()` aren't used by `app.py` (the Streamlit table

@@ -3,6 +3,7 @@ Turns game-level rows into a stat block per span, then assembles
 N-way comparisons across spans (players, years, or mixed).
 """
 from __future__ import annotations
+from collections.abc import Mapping
 import pandas as pd
 from .data import NBADataStore, COUNTING_STATS, TEAM_BOX_STATS
 from .models import PlayerSpan, DuoSpan
@@ -165,7 +166,7 @@ def _single_usg_pct(valid: pd.DataFrame, prefix: str) -> float | None:
     return 100 * (player_events * (team_min / 5)) / (player_min * team_events)
 
 
-def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
+def _compute_team_context(games_with_team: pd.DataFrame, game_minutes: float = 48) -> dict | None:
     """
     Team-level context for the games in this span: scoring pace, offensive
     rating, and defensive rating. Possessions are a standard single-team
@@ -178,9 +179,9 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
            100 opponent possessions -- lower is better defense)
 
     Pace uses the standard NBA formula (both sides' possessions, normalized
-    to a 48-minute game via team minutes played -- this is why it needed
-    TEAM_MIN, which wasn't wired into anything until now):
-      Pace = 48 * ((team_poss + opp_poss) / (2 * (team_MIN / 5)))
+    to one regulation game -- game_minutes, 48 in the NBA and 40 in the
+    WNBA -- via team minutes played, which is why it needs TEAM_MIN):
+      Pace = game_minutes * ((team_poss + opp_poss) / (2 * (team_MIN / 5)))
 
     Margin of victory (MOV) is the plain, un-pace-adjusted average scoring
     margin (team points - opponent points, per game) -- distinct from Net
@@ -236,7 +237,7 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
                       + 0.44 * valid_pace["OPP_FTA"]).sum()
         team_min_p = valid_pace["TEAM_MIN"].sum()
         if team_min_p:
-            result["team_pace"] = 48 * ((team_poss_p + opp_poss_p) / (2 * (team_min_p / 5)))
+            result["team_pace"] = game_minutes * ((team_poss_p + opp_poss_p) / (2 * (team_min_p / 5)))
 
     return result
 
@@ -331,8 +332,10 @@ def _compute_consistency(games: pd.DataFrame) -> dict:
     return result
 
 
-def _stat_block(games: pd.DataFrame) -> dict | None:
-    """One span's stats for one season-type (regular or playoffs). None if no games played."""
+def _stat_block(games: pd.DataFrame, game_minutes: float = 48) -> dict | None:
+    """One span's stats for one season-type (regular or playoffs). None if no
+    games played. game_minutes is the league's regulation game length (see
+    NBADataStore.game_minutes), which pace is normalized to."""
     if games.empty:
         return None
 
@@ -369,7 +372,7 @@ def _stat_block(games: pd.DataFrame) -> dict | None:
     # usage% and team context need TEAM_* columns -- only present if this df
     # came from games_with_team_context(). Fall back to None otherwise.
     usage = _compute_usage(games) if "TEAM_MIN" in games.columns else None
-    team = _compute_team_context(games) if "TEAM_PTS" in games.columns else None
+    team = _compute_team_context(games, game_minutes) if "TEAM_PTS" in games.columns else None
     possessions = _compute_per_100(games) if "TEAM_MIN" in games.columns else None
     team_box = _compute_team_box(games)
 
@@ -469,7 +472,7 @@ def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
     result = {"span": span, "label": span.label, "regular": None, "playoffs": None}
     if span.include_regular:
         reg_games = games("regular")
-        result["regular"] = _stat_block(reg_games)
+        result["regular"] = _stat_block(reg_games, store.game_minutes)
         if result["regular"] is not None:
             if not h2h:
                 result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
@@ -479,7 +482,7 @@ def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
             )
     if span.include_playoffs:
         po_games = games("playoffs")
-        result["playoffs"] = _stat_block(po_games)
+        result["playoffs"] = _stat_block(po_games, store.game_minutes)
         if result["playoffs"] is not None:
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
@@ -520,7 +523,7 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
     result = {"span": duo, "label": duo.label, "regular": None, "playoffs": None}
     if duo.include_regular:
         reg_games = games("regular")
-        result["regular"] = _stat_block(reg_games)
+        result["regular"] = _stat_block(reg_games, store.game_minutes)
         if result["regular"] is not None:
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
             result["regular"]["relative_shooting"] = _relative_shooting(
@@ -528,7 +531,7 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
             )
     if duo.include_playoffs:
         po_games = games("playoffs")
-        result["playoffs"] = _stat_block(po_games)
+        result["playoffs"] = _stat_block(po_games, store.game_minutes)
         if result["playoffs"] is not None:
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
@@ -541,9 +544,20 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
     return result
 
 
-def compare_spans(spans: list[PlayerSpan | DuoSpan], store: NBADataStore) -> "ComparisonResult":
+def compare_spans(
+    spans: list[PlayerSpan | DuoSpan], store: NBADataStore | Mapping[str, NBADataStore]
+) -> "ComparisonResult":
+    """
+    store: one NBADataStore, or {league: store} when the spans may come from
+    more than one league -- each span is then read from the store for its
+    own span.league, so its percentiles, league averages and playoff
+    structure are measured against its own league.
+    """
+    def store_for(span):
+        return store[span.league] if isinstance(store, Mapping) else store
+
     aggregates = [
-        aggregate_duo_span(s, store) if isinstance(s, DuoSpan) else aggregate_span(s, store)
+        aggregate_duo_span(s, store_for(s)) if isinstance(s, DuoSpan) else aggregate_span(s, store_for(s))
         for s in spans
     ]
     return ComparisonResult(aggregates)

@@ -47,6 +47,14 @@ ROSTER_MINUTES_TOLERANCE = 5.0
 # TEAM_ID but don't represent meaningful shared floor time.
 DUO_MIN_MINUTES = 10.0
 
+# Leagues whose official team logs need _repair_team_lines. The WNBA's
+# team logs carry MIN = 0 for every game 1997-2003 and scrambled values
+# through 2004, and TOV = 0 for every game of 1997, 2000 and 2003 -- zeros
+# standing in for "not recorded", while the player logs are complete. The NBA's team MIN gaps are all
+# pre-1964, before turnovers were recorded, so nothing that divides by team
+# minutes (USG%, per-100, pace -- all need TOV) can use those games anyway.
+REPAIR_TEAM_MINUTES_LEAGUES = {"WNBA"}
+
 # Same idea for head-to-head: both players must log at least this many
 # minutes, on OPPOSITE teams, for a game to count as them "playing against
 # each other" -- a 3-minute cameo before an ankle roll isn't a matchup.
@@ -142,6 +150,32 @@ def _fill_missing_team_stats(
     return out.drop(columns=[key] + [f"_recon_{c}" for c in src_cols])
 
 
+def _repair_team_lines(team: pd.DataFrame, players: pd.DataFrame, game_minutes: float) -> pd.DataFrame:
+    """
+    Two fixes for team logs that record "missing" as zero.
+
+    TOV = 0 becomes NaN: no team has ever played a turnover-free game, so a
+    zero is a blank, and a blank is what _fill_missing_team_stats rebuilds
+    from the player logs (and asterisks as an estimate). Left as a zero it
+    would silently shrink every possession count built on it.
+
+    MIN: replace a team's MIN_NUM with its players' summed minutes wherever the
+    official value falls short of a full game (5 * game_minutes, less
+    ROSTER_MINUTES_TOLERANCE) but the player rows add up to at least one --
+    the summed-minutes total is itself the proof the roster is complete, the
+    same check _fill_missing_team_stats makes. Everything that divides by
+    team minutes (USG%, per-100, pace) is off by the ratio otherwise, or
+    dividing by zero.
+    """
+    full_game = 5 * game_minutes - ROSTER_MINUTES_TOLERANCE
+    summed = players.groupby(["GAME_ID", "TEAM_ID"])["MIN_NUM"].sum().rename("_player_min")
+    out = team.join(summed, on=["GAME_ID", "TEAM_ID"])
+    out["TOV"] = out["TOV"].where(out["TOV"] != 0)
+    fix = (out["MIN_NUM"] < full_game) & (out["_player_min"] >= full_game)
+    out.loc[fix, "MIN_NUM"] = out.loc[fix, "_player_min"]
+    return out.drop(columns="_player_min")
+
+
 class NBADataStore:
     """
     Lazily loads the parquet game logs and serves filtered/prepped rows.
@@ -152,6 +186,12 @@ class NBADataStore:
     keeps from_config() lazy: resolving a Hugging Face file can mean
     downloading it, and nothing should pay that cost for a dataset the
     session never touches (most comparisons never open the playoff logs).
+
+    One store holds ONE league. Everything league-wide here (percentile
+    pools, league averages, playoff depth, standings) is keyed by season
+    alone, and NBA 2015 and WNBA 2015 are different seasons -- so mixing
+    leagues in a comparison means one store per league, with each span
+    read from its own league's store (see compare.compare_spans).
     """
 
     def __init__(
@@ -160,7 +200,12 @@ class NBADataStore:
         playoff_path: PathSource = "nba_playoffs_gamelogs.parquet",
         team_regular_path: PathSource = "nba_team_gamelogs.parquet",
         team_playoff_path: PathSource = "nba_team_playoffs_gamelogs.parquet",
+        league: str = "NBA",
     ):
+        from . import config
+        self.league = league
+        # Regulation length of one game, in minutes -- pace is per this.
+        self.game_minutes = config.GAME_MINUTES[league]
         self._paths: dict[str, PathSource] = {
             "regular": regular_path,
             "playoffs": playoff_path,
@@ -170,7 +215,7 @@ class NBADataStore:
         self._cache: dict[str, pd.DataFrame] = {}
 
     @classmethod
-    def from_config(cls) -> "NBADataStore":
+    def from_config(cls, league: str = "NBA") -> "NBADataStore":
         """
         Convenience constructor using the source configured in config.py --
         the Hugging Face dataset by default. Constructing the store touches
@@ -178,10 +223,11 @@ class NBADataStore:
         """
         from . import config
         return cls(
-            regular_path=partial(config.resolve, "regular"),
-            playoff_path=partial(config.resolve, "playoffs"),
-            team_regular_path=partial(config.resolve, "team_regular"),
-            team_playoff_path=partial(config.resolve, "team_playoffs"),
+            regular_path=partial(config.resolve, "regular", league),
+            playoff_path=partial(config.resolve, "playoffs", league),
+            team_regular_path=partial(config.resolve, "team_regular", league),
+            team_playoff_path=partial(config.resolve, "team_playoffs", league),
+            league=league,
         )
 
     def _load(self, key: str) -> pd.DataFrame:
@@ -189,7 +235,11 @@ class NBADataStore:
             source = self._paths[key]
             if callable(source):
                 source = source()
-            self._cache[key] = _prep(pd.read_parquet(source))
+            df = _prep(pd.read_parquet(source))
+            if key.startswith("team_") and self.league in REPAIR_TEAM_MINUTES_LEAGUES:
+                players = self._load(key.removeprefix("team_"))
+                df = _repair_team_lines(df, players, self.game_minutes)
+            self._cache[key] = df
         return self._cache[key]
 
     def _reconstructed_team_lines(self, season_type: str) -> pd.DataFrame:

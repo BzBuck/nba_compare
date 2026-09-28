@@ -26,7 +26,10 @@ import json
 # 2: custom formulas can carry "fmt"/"lower"/"managed", and saves carry
 #    "user_presets". Version-1 saves load unchanged -- every new field is
 #    optional.
-CONFIG_VERSION = 2
+# 3: "league_mode" ("NBA", "WNBA" or "Both"). Older saves are all NBA.
+CONFIG_VERSION = 3
+
+LEAGUE_MODES = ("NBA", "WNBA", "Both")
 
 
 class ConfigError(ValueError):
@@ -41,6 +44,7 @@ def serialize_config(
     duos: list[dict] | None = None,
     user_presets: list[dict] | None = None,
     head_to_head: bool = False,
+    league_mode: str = "NBA",
 ) -> str:
     """
     spans: list of {"player_id": int, "player_name": str, "seasons": [int,...],
@@ -52,6 +56,7 @@ def serialize_config(
                      "fmt": str, "lower": bool, "managed": bool
     user_presets: list of {"name": str, "stats": [str,...], "formulas": [formula,...]}
     head_to_head: whether head-to-head mode was on
+    league_mode: which league(s) the player search covered -- "NBA", "WNBA" or "Both"
     Returns a compact base64 string, safe to copy/paste or save to a file.
     """
     payload = {
@@ -63,6 +68,7 @@ def serialize_config(
         "accolade_path": accolade_path,
         "user_presets": user_presets or [],
         "head_to_head": head_to_head,
+        "league_mode": league_mode,
     }
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -71,7 +77,8 @@ def serialize_config(
 def deserialize_config(code: str) -> dict:
     """
     Returns {"spans": [...], "stat_order": [...], "custom_formulas": [...],
-    "accolade_path": str, "user_presets": [...], "head_to_head": bool, "config_version_found": int|None} with every field
+    "accolade_path": str, "user_presets": [...], "head_to_head": bool, "league_mode": str,
+    "config_version_found": int|None} with every field
     type-checked and defaulted. Raises ConfigError (with a message safe to
     show the user) only if the code can't be read as a save at all --
     garbage input, corrupted base64/JSON. Never raises for a well-formed
@@ -174,6 +181,7 @@ def deserialize_config(code: str) -> dict:
         "accolade_path": accolade_path,
         "user_presets": user_presets,
         "head_to_head": payload.get("head_to_head") is True,
+        "league_mode": payload.get("league_mode") if payload.get("league_mode") in LEAGUE_MODES else "NBA",
         "config_version_found": payload.get("config_version"),
     }
 
