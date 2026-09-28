@@ -12,12 +12,54 @@ exact same code path.
 ## Setup
 
 ```bash
-cd "/Users/blakebuckner/Documents/Code/nba_compare"
+cd nba_compare
 pip install -r requirements.txt
 ```
 
-Point `config.py` at your data if the folder layout below doesn't already
-match (see "Folder layout").
+That's the whole setup — there's no data to download by hand.
+
+## Where the data comes from
+
+The four parquet game-log files are pulled from the Hugging Face dataset
+[BBuckz/basketball-encyclopedia](https://huggingface.co/datasets/BBuckz/basketball-encyclopedia),
+from its `nba/` folder:
+
+| logical name    | file                                 |
+|-----------------|--------------------------------------|
+| `regular`       | `nba_gamelogs.parquet`               |
+| `playoffs`      | `nba_playoffs_gamelogs.parquet`      |
+| `team_regular`  | `nba_team_gamelogs.parquet`          |
+| `team_playoffs` | `nba_team_playoffs_gamelogs.parquet` |
+
+Each file is downloaded on **first use** and then served from the local
+Hugging Face cache (`~/.cache/huggingface`, or wherever `HF_HOME` points),
+so only the first run of a fresh machine waits on the network — and once a
+file is cached, it loads even with no connection. The download is lazy per
+file, not all four up front: a comparison that never opens the playoff tabs
+never fetches the playoff logs. `NBADataStore.from_config()` itself does no
+I/O at all.
+
+To publish new data, push it to the dataset repo; clients pick it up on
+their next cold start. Nothing in this project needs to change.
+
+### Overriding the source
+
+Both of these are optional environment variables, read by
+[`config.py`](nba_compare/config.py):
+
+```bash
+# read the parquet files out of a local folder instead of the Hub --
+# offline work, or testing a rebuild before it's pushed
+export NBA_COMPARE_DATA_DIR="../NBA Encyclopedia/data"
+
+# pull a branch, tag, or commit sha other than main -- pin a sha when a
+# run has to be reproducible against one version of the data
+export NBA_COMPARE_HF_REVISION=main
+```
+
+The override folder is expected to use the same filenames the Hub repo does.
+`HF_TOKEN` and `HF_HOME` are read by `huggingface_hub` itself; a token is
+only needed if the dataset is ever made private.
 
 ## Interactive UI
 
@@ -78,20 +120,17 @@ if you point the sidebar at an accolades CSV (see `accolades.py`).
 python smoke_test.py
 ```
 
-Confirms your parquet paths resolve, `SEASON_ID` parsing works on real
-data, and the comparison + chart pipeline runs end to end.
+Prints the data source it resolved, then confirms the files load,
+`SEASON_ID` parsing works on real data, and the comparison + chart pipeline
+runs end to end.
 
 ## Folder layout
 
+The project is self-contained — the data lives on the Hub (see "Where the
+data comes from"), not in a sibling folder.
+
 ```
-Code/
-├── NBA Encyclopedia/
-│   └── data/
-│       ├── nba_gamelogs.parquet
-│       ├── nba_playoffs_gamelogs.parquet
-│       ├── nba_team_gamelogs.parquet
-│       └── nba_team_playoffs_gamelogs.parquet
-└── nba_compare/                    <- project root, cd here to work
+nba_compare/                        <- project root, cd here to work
     ├── nba_compare/                <- the importable package
     │   ├── __init__.py
     │   ├── models.py                PlayerSpan
@@ -105,7 +144,7 @@ Code/
     │   ├── players.py               player search helper for the UI
     │   ├── accolades.py             pluggable Awards & Honors source
     │   ├── viz.py                   Plotly charts (library-level, see below)
-    │   └── config.py                DATA_DIR — edit this if your data moves
+    │   └── config.py                where the parquet files come from
     ├── app.py                       Streamlit UI, run this
     ├── smoke_test.py                quick end-to-end check
     ├── requirements.txt
@@ -114,7 +153,7 @@ Code/
 
 The package and the project root share the name `nba_compare` on purpose —
 that's what lets `from nba_compare import ...` resolve when you run scripts
-from the project root, without needing anything in the shared `Code/` folder.
+from the project root, with nothing to install or put on the path.
 
 ## Stat catalog
 
@@ -191,7 +230,7 @@ just qualifying players. Unlike percentiles (below), this is meaningful
 for a **Duo** span too, since it's plain subtraction against a league
 baseline rather than a rank against a distribution of individual players.
 
-### Per 100 possessions — and what the ★ means
+### Per 100 possessions — and what the `*` means
 
 `/100` rows are Basketball-Reference's "Per 100 Poss": the stat per 100 team
 possessions the player was on the floor for. A box score never records how
@@ -223,7 +262,7 @@ per-36 multiplied by a constant, which adds exactly zero information while
 Basketball-Reference declines to publish pace before 1973-74 for the same
 reason. Where the possessions can't be estimated, these rows show `—`.
 
-**Era coverage, and the ★.** The team logs only carry FGA/FTA/TOV/OREB from
+**Era coverage, and the `*`.** The team logs only carry FGA/FTA/TOV/OREB from
 **1985** onward. Before that they're empty, which would blank out every
 per-100 row (and Pace/ORtg/DRtg, as it always has). But the *player* logs
 reach further back for some of those columns, so where the official team line
@@ -236,10 +275,10 @@ overtime games pass automatically).
 | Seasons | Source | Marked |
 |---|---|---|
 | 1985– | official team box scores | no |
-| 1977–1984 | rebuilt from summed player rows | ★ |
+| 1977–1984 | rebuilt from summed player rows | `*` |
 | –1976 | not computable at all | shows `—` |
 
-Anything resting on a rebuilt line gets a **★** next to it in the table, with
+Anything resting on a rebuilt line gets a **`*`** next to it in the table, with
 a footnote. Two reasons it's a caveat and not just a footnote of pedantry:
 coverage inside 1977-1984 is partial (roughly 35% of games in the thinnest
 seasons up to ~93% in 1983) and clusters by team, and team turnovers that
@@ -279,7 +318,7 @@ alongside player MIN/G.
 
 These used to come back blank for every season before 1985, since the team
 logs have no possession columns that far back. They now fill in for roughly
-1977-1984 from rebuilt team lines, marked with a ★ — see "Per 100
+1977-1984 from rebuilt team lines, marked with a `*` — see "Per 100
 possessions" above.
 
 **Individual (player-level) ORtg/DRtg are NOT implemented.** The real

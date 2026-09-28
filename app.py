@@ -13,6 +13,7 @@ import streamlit as st
 from streamlit_sortables import sort_items
 
 from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans, AccoladeStore
+from nba_compare import config as data_config
 from nba_compare.players import search_players
 from nba_compare.table import (
     build_stat_table, build_stat_flags, render_stat_table_html, build_awards_table,
@@ -32,8 +33,15 @@ st.set_page_config(page_title="NBA Compare", layout="wide")
 
 @st.cache_resource
 def get_store_and_directory():
+    """
+    The store plus the full player directory. Building the directory is what
+    pulls the regular-season game logs, which on a cold start means
+    downloading them from the Hugging Face dataset (see config.py) -- hence
+    the spinner; every run after that is served from the local HF cache.
+    """
     store = NBADataStore.from_config()
-    directory = store.all_players("regular")
+    with st.spinner(f"Loading game logs from {data_config.describe_source()}..."):
+        directory = store.all_players("regular")
     return store, directory
 
 

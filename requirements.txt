@@ -3,3 +3,4 @@ pyarrow
 plotly
 streamlit
 streamlit-sortables
+huggingface_hub

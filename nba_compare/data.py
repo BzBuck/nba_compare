@@ -9,7 +9,14 @@ FTM, FTA, FT_PCT, OREB, DREB, REB, AST, STL, BLK, TOV, PF, PTS, PLUS_MINUS,
 FANTASY_PTS, VIDEO_AVAILABLE
 """
 from __future__ import annotations
+from functools import partial
+from typing import Callable, Union
+
 import pandas as pd
+
+# A parquet source: a path/URL pandas can read, or a callable producing one
+# on demand (see NBADataStore).
+PathSource = Union[str, Callable[[], str]]
 
 # Counting stats that are safe to SUM across games (rates get recomputed from these).
 COUNTING_STATS = [
@@ -81,7 +88,7 @@ def _fill_missing_team_stats(
 
     Accumulates a boolean TEAM_EST column marking rows where at least one
     value came from a rebuilt line rather than the official team logs --
-    that's what the comparison table stars.
+    that's what the comparison table marks with an asterisk.
     """
     if merged.empty or id_col not in merged.columns:
         return merged
@@ -119,18 +126,24 @@ def _fill_missing_team_stats(
 
 class NBADataStore:
     """
-    Lazily loads your parquet files and serves filtered/prepped game logs.
+    Lazily loads the parquet game logs and serves filtered/prepped rows.
     Only loads a file the first time it's actually needed.
+
+    Each source may be given either as a path/URL anything pandas can read,
+    or as a zero-argument callable returning one. The callable form is what
+    keeps from_config() lazy: resolving a Hugging Face file can mean
+    downloading it, and nothing should pay that cost for a dataset the
+    session never touches (most comparisons never open the playoff logs).
     """
 
     def __init__(
         self,
-        regular_path: str = "nba_gamelogs.parquet",
-        playoff_path: str = "nba_playoffs_gamelogs.parquet",
-        team_regular_path: str = "nba_team_gamelogs.parquet",
-        team_playoff_path: str = "nba_team_playoffs_gamelogs.parquet",
+        regular_path: PathSource = "nba_gamelogs.parquet",
+        playoff_path: PathSource = "nba_playoffs_gamelogs.parquet",
+        team_regular_path: PathSource = "nba_team_gamelogs.parquet",
+        team_playoff_path: PathSource = "nba_team_playoffs_gamelogs.parquet",
     ):
-        self._paths = {
+        self._paths: dict[str, PathSource] = {
             "regular": regular_path,
             "playoffs": playoff_path,
             "team_regular": team_regular_path,
@@ -140,18 +153,25 @@ class NBADataStore:
 
     @classmethod
     def from_config(cls) -> "NBADataStore":
-        """Convenience constructor using the paths in config.py."""
+        """
+        Convenience constructor using the source configured in config.py --
+        the Hugging Face dataset by default. Constructing the store touches
+        no data and hits no network; each file is fetched on first use.
+        """
         from . import config
         return cls(
-            regular_path=str(config.REGULAR_PATH),
-            playoff_path=str(config.PLAYOFF_PATH),
-            team_regular_path=str(config.TEAM_REGULAR_PATH),
-            team_playoff_path=str(config.TEAM_PLAYOFF_PATH),
+            regular_path=partial(config.resolve, "regular"),
+            playoff_path=partial(config.resolve, "playoffs"),
+            team_regular_path=partial(config.resolve, "team_regular"),
+            team_playoff_path=partial(config.resolve, "team_playoffs"),
         )
 
     def _load(self, key: str) -> pd.DataFrame:
         if key not in self._cache:
-            self._cache[key] = _prep(pd.read_parquet(self._paths[key]))
+            source = self._paths[key]
+            if callable(source):
+                source = source()
+            self._cache[key] = _prep(pd.read_parquet(source))
         return self._cache[key]
 
     def _reconstructed_team_lines(self, season_type: str) -> pd.DataFrame:
@@ -176,7 +196,7 @@ class NBADataStore:
         0.6% light. Coverage over 1977-1984 runs from ~35% of games to ~93%
         (best in 1983), and the games that survive are clustered by team,
         so a rebuilt league-wide average is a few points off a true one --
-        why anything resting on these is starred in the table rather than
+        why anything resting on these is asterisked in the table rather than
         shown as equivalent to the post-1985 numbers.
         """
         cache_key = f"recon_{season_type}"

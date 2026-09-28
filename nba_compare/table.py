@@ -126,12 +126,12 @@ DEFAULT_STAT_LABELS = [
 ROW_FORMATS = {label: fmt for label, (_getter, fmt, _lower) in STAT_DEFS.items()}
 LOWER_IS_BETTER = {label for label, (_getter, _fmt, lower) in STAT_DEFS.items() if lower}
 
-# Star marker for a value that rests on rebuilt team box-score lines rather
-# than the official ones -- see ESTIMATED_SOURCES and data.py's
+# Footnote marker for a value that rests on rebuilt team box-score lines
+# rather than the official ones -- see ESTIMATED_SOURCES and data.py's
 # _reconstructed_team_lines. In practice this means 1977-1984.
-ESTIMATED_MARK = "\u2605"
+ESTIMATED_MARK = "*"
 ESTIMATED_NOTE = (
-    "\u2605 Built from team box-score lines rebuilt by summing each game's individual "
+    "* Built from team box-score lines rebuilt by summing each game's individual "
     "player rows \u2014 the official team logs carry no FGA/FTA/TOV/OREB before 1985. "
     "Covers only part of each 1977\u20131984 season, and misses team turnovers that "
     "aren't charged to a player, so treat these as close estimates rather than "
@@ -139,7 +139,7 @@ ESTIMATED_NOTE = (
     "no possession estimate to make."
 )
 
-# Which rows CAN carry the star, and which part of the stat block knows
+# Which rows CAN carry the mark, and which part of the stat block knows
 # whether they do. Every one of these is computed out of the team box score,
 # so it's only these that a rebuilt team line can affect -- a player's own
 # PTS/G is official in every season and never gets marked.
@@ -163,7 +163,7 @@ ESTIMATED_SOURCES = {
 
 
 def _is_estimated(block: dict | None, label: str) -> bool:
-    """Whether this span's value for this row should be starred."""
+    """Whether this span's value for this row should carry ESTIMATED_MARK."""
     source = ESTIMATED_SOURCES.get(label)
     if block is None or source is None:
         return False
@@ -209,12 +209,12 @@ def build_stat_flags(
     """
     Booleans in the SAME shape and order as build_stat_table: True where that
     span's value for that row came out of rebuilt team box-score lines and so
-    should be starred. Pass to render_stat_table_html(flags=...).
+    should be marked. Pass to render_stat_table_html(flags=...).
 
     Built as a separate frame rather than as part of the table because
     build_stat_table has to stay purely numeric -- that's what the best/worst
     highlighting compares on. Custom formulas never flag, even when they
-    reference a starred stat; a formula's provenance isn't tracked, and
+    reference a marked stat; a formula's provenance isn't tracked, and
     guessing at it would be worse than leaving it unmarked.
     """
     stat_defs = stat_defs if stat_defs is not None else STAT_DEFS
@@ -258,10 +258,10 @@ def render_stat_table_html(
     output of formats_and_lower_is_better(your_stat_defs) for a table built
     from a different/merged stat_defs (e.g. including custom formulas).
 
-    flags (from build_stat_flags, same shape as df) stars the cells whose
-    value rests on rebuilt team data, and appends ESTIMATED_NOTE under the
-    table -- only when at least one cell is actually starred, so tables of
-    purely official numbers stay clean.
+    flags (from build_stat_flags, same shape as df) marks the cells whose
+    value rests on rebuilt team data with ESTIMATED_MARK, and appends
+    ESTIMATED_NOTE under the table -- only when at least one cell is
+    actually marked, so tables of purely official numbers stay clean.
     """
     formats = formats if formats is not None else ROW_FORMATS
     lower_is_better = lower_is_better if lower_is_better is not None else LOWER_IS_BETTER
@@ -297,7 +297,7 @@ def render_stat_table_html(
             text = fmt_cell(row_label, v)
             if v is not None and not pd.isna(v) and is_flagged(row_label, col):
                 any_flagged = True
-                text += f'<span style="opacity:.75;font-size:.8em;vertical-align:super;">{ESTIMATED_MARK}</span>'
+                text += f'<span style="opacity:.7;margin-left:1px;">{ESTIMATED_MARK}</span>'
             is_best = best is not None and v == best
             is_worst = (not is_best) and worst is not None and v == worst
             if is_best:

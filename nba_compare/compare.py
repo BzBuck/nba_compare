@@ -20,7 +20,7 @@ def _any_estimated(rows: pd.DataFrame) -> bool:
     True if any of these rows had team box-score values rebuilt from summed
     player lines instead of taken from the official team logs (see
     data._fill_missing_team_stats) -- what the comparison table marks with
-    a star.
+    an asterisk.
 
     Always asked of the SUBSET a stat was actually computed from, never the
     whole span: a pre-1977 row can carry TEAM_EST from a filled PTS while
@@ -220,7 +220,7 @@ def _compute_team_context(games_with_team: pd.DataFrame) -> dict | None:
     # `valid` (the possession subset), not valid_mov -- TEAM_PTS/OPP_PTS are
     # present in the official logs for every season back to 1946, so MOV is
     # never an estimate even when everything around it is, and table.py
-    # deliberately leaves that row unstarred.
+    # deliberately leaves that row unmarked.
     result["estimated"] = _any_estimated(valid)
 
     pace_cols = ["TEAM_MIN", "TEAM_FGA", "TEAM_OREB", "TEAM_FTA", "TEAM_TOV",
