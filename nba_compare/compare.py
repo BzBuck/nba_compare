@@ -4,11 +4,13 @@ N-way comparisons across spans (players, years, or mixed).
 """
 from __future__ import annotations
 from collections.abc import Mapping
+import dataclasses
 import pandas as pd
 from .data import NBADataStore, COUNTING_STATS, TEAM_BOX_STATS
 from .models import PlayerSpan, DuoSpan
 from . import playoffs as _playoffs
 from . import percentiles as _percentiles
+from . import filters as _filters
 
 # Stats we compute per-game standard deviation / coefficient-of-variation for,
 # as a rough "consistency" read: how much a player's game-to-game output swings.
@@ -398,6 +400,12 @@ def _stat_block(games: pd.DataFrame, game_minutes: float = 48) -> dict | None:
         "consistency": _compute_consistency(games),
         "plus_minus_per_game": games["PLUS_MINUS"].mean() if "PLUS_MINUS" in games.columns else None,
         "plus_minus_std": plus_minus_std,
+        # Plus-minus isn't recorded before NBA 1996-97 / WNBA 2008, and both
+        # numbers above skip those games -- (games with it, games) is what
+        # lets the table mark a span whose +/- covers only part of its games.
+        "plus_minus_coverage": (
+            int(games["PLUS_MINUS"].notna().sum()) if "PLUS_MINUS" in games.columns else 0, gp,
+        ),
     }
 
 
@@ -450,7 +458,43 @@ def _regular_season_seed(store: NBADataStore, games: pd.DataFrame) -> float | No
     return sum(seeds) / len(seeds) if seeds else None
 
 
-def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
+def span_games(span: PlayerSpan | DuoSpan, store: NBADataStore, season_type: str) -> pd.DataFrame:
+    """Every game a span's numbers come from, before any game filter: one
+    player's games, a duo's shared games, or either one narrowed to the
+    games against span.vs_player_ids (head-to-head)."""
+    if span.vs_player_ids:
+        return store.games_head_to_head(span.player_ids, span.vs_player_ids, span.seasons, season_type)
+    if isinstance(span, DuoSpan):
+        return store.games_together(span.player_a_id, span.player_b_id, span.seasons, season_type)
+    return store.games_with_team_context(span.player_id, span.seasons, season_type)
+
+
+def _filtered_games(
+    span, store: NBADataStore, season_type: str,
+    game_filter: _filters.GameFilter | None, keep_ids: Mapping[str, set] | None,
+    seasons: list[int] | None = None,
+) -> tuple[pd.DataFrame, int]:
+    """(the span's games after the filter, how many there were before it).
+    seasons, when given, is the span's seasons that passed the season
+    qualifiers (see qualifying_seasons). keep_ids, when given, is the
+    already-decided set of GAME_IDs per season type -- how compare_spans
+    makes both sides of a filtered head-to-head use the same games."""
+    games = span_games(span, store, season_type)
+    total = len(games)
+    if seasons is not None:
+        games = games[games["SEASON"].isin(seasons)].reset_index(drop=True)
+    if keep_ids is not None:
+        games = games[games["GAME_ID"].isin(keep_ids[season_type])].reset_index(drop=True)
+    else:
+        games = _filters.apply_filter(games, store, game_filter, season_type)
+    return games, total
+
+
+def aggregate_span(
+    span: PlayerSpan, store: NBADataStore,
+    game_filter: _filters.GameFilter | None = None, keep_ids: Mapping[str, set] | None = None,
+    seasons: list[int] | None = None,
+) -> dict:
     """
     A head-to-head span (span.vs_player_ids set) is built from only the
     games against that player, and differs in two ways:
@@ -461,45 +505,64 @@ def aggregate_span(span: PlayerSpan, store: NBADataStore) -> dict:
       opponent, with W/L from those games. The team's other series that
       postseason would otherwise show up as "(DNP)" and count as series
       missed to injury.
+
+    An active game_filter (see filters.py) narrows the games the same way
+    and gets the same two treatments, for the same reasons: percentiles
+    describe whole seasons, not the filtered games, and a series with no
+    game passing the filter isn't a series the player missed.
+    "filter_counts" maps each season type included to (games kept, games
+    before the filter) -- equal when no filter is active -- plus "seasons":
+    (seasons kept, seasons in the span) when `seasons` narrows it. `seasons`
+    is the span's seasons that passed the filter's season qualifiers (see
+    qualifying_seasons); a season-only filter keeps percentiles, since
+    they describe whole seasons.
     """
-    h2h = bool(span.vs_player_ids)
+    def narrowed(season_type: str) -> bool:
+        # keep_ids only exists for a head-to-head pair, so vs_player_ids covers it.
+        return bool(span.vs_player_ids) or (game_filter is not None and game_filter.narrows(season_type))
 
-    def games(season_type: str) -> pd.DataFrame:
-        if h2h:
-            return store.games_head_to_head(span.player_ids, span.vs_player_ids, span.seasons, season_type)
-        return store.games_with_team_context(span.player_id, span.seasons, season_type)
-
-    result = {"span": span, "label": span.label, "regular": None, "playoffs": None}
+    # Percentiles and the playoff series log read span.seasons directly, so
+    # they see only the qualifying seasons through this copy.
+    qualified = dataclasses.replace(span, seasons=seasons, label=span.label) if seasons is not None else span
+    result = {"span": span, "label": span.label, "regular": None, "playoffs": None, "filter_counts": {}}
+    if seasons is not None:
+        result["filter_counts"]["seasons"] = (len(seasons), len(span.seasons))
     if span.include_regular:
-        reg_games = games("regular")
+        reg_games, reg_total = _filtered_games(span, store, "regular", game_filter, keep_ids, seasons)
+        result["filter_counts"]["regular"] = (len(reg_games), reg_total)
         result["regular"] = _stat_block(reg_games, store.game_minutes)
         if result["regular"] is not None:
-            if not h2h:
-                result["regular"]["percentiles"] = _percentiles.span_percentiles(store, span, "regular")
+            if not narrowed("regular"):
+                result["regular"]["percentiles"] = _percentiles.span_percentiles(store, qualified, "regular")
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
             result["regular"]["relative_shooting"] = _relative_shooting(
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
     if span.include_playoffs:
-        po_games = games("playoffs")
+        po_games, po_total = _filtered_games(span, store, "playoffs", game_filter, keep_ids, seasons)
+        result["filter_counts"]["playoffs"] = (len(po_games), po_total)
         result["playoffs"] = _stat_block(po_games, store.game_minutes)
         if result["playoffs"] is not None:
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
-            if h2h:
+            if narrowed("playoffs"):
                 records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
                 records = [r for r in records if r["player_played"]]
             else:
-                result["playoffs"]["percentiles"] = _percentiles.span_percentiles(store, span, "playoffs")
-                raw_playoff_games = store.games(span.player_id, span.seasons, "playoffs")
+                result["playoffs"]["percentiles"] = _percentiles.span_percentiles(store, qualified, "playoffs")
+                raw_playoff_games = store.games(span.player_id, qualified.seasons, "playoffs")
                 records = _playoffs.compute_series_records(store, raw_playoff_games)
             result["playoffs"]["series_records"] = records
             result["playoffs"]["depth"] = _playoffs.depth_summary(records)
     return result
 
 
-def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
+def aggregate_duo_span(
+    duo: DuoSpan, store: NBADataStore,
+    game_filter: _filters.GameFilter | None = None, keep_ids: Mapping[str, set] | None = None,
+    seasons: list[int] | None = None,
+) -> dict:
     """
     Same shape of result as aggregate_span(), but built from the two
     players' COMBINED numbers for games they shared as teammates (see
@@ -511,18 +574,17 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
 
     A head-to-head duo (duo.vs_player_ids set) keeps only the games against
     those player(s), and its series records only the series played against
-    them -- see aggregate_span for why.
+    them -- see aggregate_span for why. An active game_filter likewise.
     """
-    h2h = bool(duo.vs_player_ids)
+    def narrowed(season_type: str) -> bool:
+        return bool(duo.vs_player_ids) or (game_filter is not None and game_filter.narrows(season_type))
 
-    def games(season_type: str) -> pd.DataFrame:
-        if h2h:
-            return store.games_head_to_head(duo.player_ids, duo.vs_player_ids, duo.seasons, season_type)
-        return store.games_together(duo.player_a_id, duo.player_b_id, duo.seasons, season_type)
-
-    result = {"span": duo, "label": duo.label, "regular": None, "playoffs": None}
+    result = {"span": duo, "label": duo.label, "regular": None, "playoffs": None, "filter_counts": {}}
+    if seasons is not None:
+        result["filter_counts"]["seasons"] = (len(seasons), len(duo.seasons))
     if duo.include_regular:
-        reg_games = games("regular")
+        reg_games, reg_total = _filtered_games(duo, store, "regular", game_filter, keep_ids, seasons)
+        result["filter_counts"]["regular"] = (len(reg_games), reg_total)
         result["regular"] = _stat_block(reg_games, store.game_minutes)
         if result["regular"] is not None:
             result["regular"]["avg_seed"] = _regular_season_seed(store, reg_games)
@@ -530,35 +592,96 @@ def aggregate_duo_span(duo: DuoSpan, store: NBADataStore) -> dict:
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
     if duo.include_playoffs:
-        po_games = games("playoffs")
+        po_games, po_total = _filtered_games(duo, store, "playoffs", game_filter, keep_ids, seasons)
+        result["filter_counts"]["playoffs"] = (len(po_games), po_total)
         result["playoffs"] = _stat_block(po_games, store.game_minutes)
         if result["playoffs"] is not None:
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
             records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
-            if h2h:
+            if narrowed("playoffs"):
                 records = [r for r in records if r["player_played"]]
             result["playoffs"]["series_records"] = records
             result["playoffs"]["depth"] = _playoffs.depth_summary(records)
     return result
 
 
+def qualifying_seasons(
+    span: PlayerSpan | DuoSpan, store: NBADataStore, conditions: tuple[_filters.Condition, ...],
+) -> list[int]:
+    """
+    The span's seasons that pass the season qualifiers (filters.SEASON_FIELDS),
+    judged on the FULL regular season: the player's own games, or a duo's
+    shared games -- never the head-to-head meetings, which would make "GP"
+    mean three or four games, and never after a game filter.
+    """
+    if isinstance(span, DuoSpan):
+        games = store.games_together(span.player_a_id, span.player_b_id, span.seasons, "regular")
+    else:
+        games = store.games(span.player_id, span.seasons, "regular")
+    return _filters.seasons_passing(games, store, conditions)
+
+
+def _head_to_head_keep_ids(
+    a: PlayerSpan | DuoSpan, b: PlayerSpan | DuoSpan, store: NBADataStore, game_filter: _filters.GameFilter,
+) -> dict[str, set]:
+    """
+    The GAME_IDs both sides of a filtered head-to-head keep, per season
+    type. Applying the filter to each side on its own would split them: a
+    "Wins" filter keeps opposite games for the two sides, and "MIN >= 30"
+    could keep a game for one player and not the other. So the whole filter
+    is read from the first row's side, the player conditions must also hold
+    for the second row, and both are built from what's left.
+    """
+    keep = {}
+    for season_type in ("regular", "playoffs"):
+        ga, gb = span_games(a, store, season_type), span_games(b, store, season_type)
+        ids_a = set(ga.loc[_filters.filter_mask(ga, store, game_filter, season_type), "GAME_ID"])
+        ids_b = set(gb.loc[_filters.filter_mask(gb, store, game_filter, season_type, players_only=True), "GAME_ID"])
+        keep[season_type] = ids_a & ids_b
+    return keep
+
+
 def compare_spans(
-    spans: list[PlayerSpan | DuoSpan], store: NBADataStore | Mapping[str, NBADataStore]
+    spans: list[PlayerSpan | DuoSpan], store: NBADataStore | Mapping[str, NBADataStore],
+    game_filter: _filters.GameFilter | None = None,
 ) -> "ComparisonResult":
     """
     store: one NBADataStore, or {league: store} when the spans may come from
     more than one league -- each span is then read from the store for its
     own span.league, so its percentiles, league averages and playoff
     structure are measured against its own league.
+
+    game_filter: optional filters.GameFilter applied to every span's games
+    before anything is computed. For a head-to-head pair, both sides keep
+    the same games (see _head_to_head_keep_ids).
     """
     def store_for(span):
         return store[span.league] if isinstance(store, Mapping) else store
 
+    h2h_pair = len(spans) == 2 and all(s.vs_player_ids for s in spans)
+
+    seasons = [None] * len(spans)
+    if game_filter is not None and game_filter.season_conditions:
+        seasons = [qualifying_seasons(s, store_for(s), game_filter.season_conditions) for s in spans]
+        if h2h_pair:
+            # Only meetings in a season BOTH sides qualify in.
+            shared = sorted(set(seasons[0]) & set(seasons[1]))
+            seasons = [shared, shared]
+
+    keep_ids = [None] * len(spans)
+    if game_filter is not None and game_filter.filters_games and h2h_pair:
+        narrowed_spans = [
+            dataclasses.replace(s, seasons=q, label=s.label) if q is not None else s
+            for s, q in zip(spans, seasons)
+        ]
+        shared_ids = _head_to_head_keep_ids(narrowed_spans[0], narrowed_spans[1], store_for(spans[0]), game_filter)
+        keep_ids = [shared_ids, shared_ids]
+
     aggregates = [
-        aggregate_duo_span(s, store_for(s)) if isinstance(s, DuoSpan) else aggregate_span(s, store_for(s))
-        for s in spans
+        (aggregate_duo_span if isinstance(s, DuoSpan) else aggregate_span)(s, store_for(s), game_filter, ids, q)
+        for s, ids, q in zip(spans, keep_ids, seasons)
     ]
     return ComparisonResult(aggregates)
 

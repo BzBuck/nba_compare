@@ -289,6 +289,38 @@ class NBADataStore:
         df = self._load(key)
         return df[df.SEASON == season]
 
+    def team_rest_days(self, season_type: str) -> pd.DataFrame:
+        """
+        GAME_ID, TEAM_ID, REST_DAYS for every team game of this season type:
+        full days off since that team's previous game, so 0 is the second
+        night of a back-to-back. A team's first game of a season has none
+        (NaN). Playoff games count from the team's previous game of either
+        type, so a playoff opener's rest is the gap since the regular season
+        ended -- which means the playoff case also loads the regular logs.
+        """
+        cache_key = f"rest_{season_type}"
+        if cache_key not in self._cache:
+            keys = ["team_regular"] if season_type == "regular" else ["team_regular", "team_playoffs"]
+            sched = pd.concat(
+                [self._load(k)[["GAME_ID", "TEAM_ID", "SEASON", "GAME_DATE"]].assign(_ST=k) for k in keys],
+                ignore_index=True,
+            )
+            sched["_DATE"] = pd.to_datetime(sched["GAME_DATE"])
+            sched = sched.sort_values(["TEAM_ID", "SEASON", "_DATE"])
+            gap = sched.groupby(["TEAM_ID", "SEASON"])["_DATE"].diff().dt.days
+            sched["REST_DAYS"] = gap - 1
+            wanted = "team_regular" if season_type == "regular" else "team_playoffs"
+            self._cache[cache_key] = (
+                sched.loc[sched["_ST"] == wanted, ["GAME_ID", "TEAM_ID", "REST_DAYS"]]
+                .drop_duplicates(["GAME_ID", "TEAM_ID"]).reset_index(drop=True)
+            )
+        return self._cache[cache_key]
+
+    def team_abbreviations(self) -> list[str]:
+        """Every team abbreviation in the regular-season team logs, all eras
+        (relocations keep their old ones -- NJN and BKN are both listed)."""
+        return sorted(self._load("team_regular")["TEAM_ABBREVIATION"].dropna().unique().tolist())
+
     def all_player_games_for_season(self, season: int, season_type: str = "regular") -> pd.DataFrame:
         """ALL players' games for one season (not filtered to one player) --
         needed to build league-wide percentile distributions."""

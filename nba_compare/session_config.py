@@ -27,7 +27,11 @@ import json
 #    "user_presets". Version-1 saves load unchanged -- every new field is
 #    optional.
 # 3: "league_mode" ("NBA", "WNBA" or "Both"). Older saves are all NBA.
-CONFIG_VERSION = 3
+# 4: "game_filter" (filters.GameFilter.to_dict() plus "enabled"). Older
+#    saves load with no filter. "accolade_path" is no longer written (the
+#    awards UI was removed until there's real awards data); older saves
+#    that carry it still load -- the field is just ignored.
+CONFIG_VERSION = 4
 
 LEAGUE_MODES = ("NBA", "WNBA", "Both")
 
@@ -40,11 +44,11 @@ def serialize_config(
     spans: list[dict],
     stat_order: list[str],
     custom_formulas: list[dict],
-    accolade_path: str = "",
     duos: list[dict] | None = None,
     user_presets: list[dict] | None = None,
     head_to_head: bool = False,
     league_mode: str = "NBA",
+    game_filter: dict | None = None,
 ) -> str:
     """
     spans: list of {"player_id": int, "player_name": str, "seasons": [int,...],
@@ -57,6 +61,8 @@ def serialize_config(
     user_presets: list of {"name": str, "stats": [str,...], "formulas": [formula,...]}
     head_to_head: whether head-to-head mode was on
     league_mode: which league(s) the player search covered -- "NBA", "WNBA" or "Both"
+    game_filter: the game filter setup, as a plain dict -- opaque here, like
+                 stat labels, and validated by the caller (filters.GameFilter.from_dict)
     Returns a compact base64 string, safe to copy/paste or save to a file.
     """
     payload = {
@@ -65,10 +71,10 @@ def serialize_config(
         "duos": duos or [],
         "stat_order": stat_order,
         "custom_formulas": custom_formulas,
-        "accolade_path": accolade_path,
         "user_presets": user_presets or [],
         "head_to_head": head_to_head,
         "league_mode": league_mode,
+        "game_filter": game_filter or {},
     }
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -77,8 +83,8 @@ def serialize_config(
 def deserialize_config(code: str) -> dict:
     """
     Returns {"spans": [...], "stat_order": [...], "custom_formulas": [...],
-    "accolade_path": str, "user_presets": [...], "head_to_head": bool, "league_mode": str,
-    "config_version_found": int|None} with every field
+    "user_presets": [...], "head_to_head": bool, "league_mode": str,
+    "game_filter": dict, "config_version_found": int|None} with every field
     type-checked and defaulted. Raises ConfigError (with a message safe to
     show the user) only if the code can't be read as a save at all --
     garbage input, corrupted base64/JSON. Never raises for a well-formed
@@ -169,19 +175,15 @@ def deserialize_config(code: str) -> dict:
                 ],
             })
 
-    accolade_path = payload.get("accolade_path", "")
-    if not isinstance(accolade_path, str):
-        accolade_path = ""
-
     return {
         "spans": spans,
         "duos": duos,
         "stat_order": stat_order,
         "custom_formulas": formulas,
-        "accolade_path": accolade_path,
         "user_presets": user_presets,
         "head_to_head": payload.get("head_to_head") is True,
         "league_mode": payload.get("league_mode") if payload.get("league_mode") in LEAGUE_MODES else "NBA",
+        "game_filter": payload.get("game_filter") if isinstance(payload.get("game_filter"), dict) else {},
         "config_version_found": payload.get("config_version"),
     }
 

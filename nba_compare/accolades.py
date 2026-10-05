@@ -1,4 +1,11 @@
 """
+NOT WIRED INTO THE APP. Groundwork for a future Awards & Honors table,
+kept until there's consistent awards data to fill it -- the app's old
+"path to accolades CSV" input was removed as clutter in the meantime.
+table.build_awards_table already turns an AccoladeStore into a table
+(duos included); the remaining work is the data itself, then a place
+for it in app.py.
+
 Accolades (All-Star, All-NBA, MVP shares, championships, Finals MVP) are
 NOT in play-by-play/box-score game logs, so this is a pluggable slot.
 

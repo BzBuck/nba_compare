@@ -15,12 +15,12 @@ from streamlit_sortables import sort_items
 
 import pandas as pd
 
-from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans, AccoladeStore
+from nba_compare import PlayerSpan, DuoSpan, NBADataStore, compare_spans
 from nba_compare import config as data_config
 from nba_compare.models import season_str
 from nba_compare.players import search_players
 from nba_compare.table import (
-    build_stat_table, build_stat_flags, render_stat_table_html, build_awards_table,
+    build_stat_table, build_stat_flags, render_stat_table_html,
     formats_and_lower_is_better, STAT_DEFS, DEFAULT_STAT_LABELS,
 )
 from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_formula
@@ -28,6 +28,11 @@ from nba_compare.session_config import serialize_config, deserialize_config, Con
 from nba_compare.presets import (
     BUILTIN_PRESETS, BUILTIN_PRESET_NAMES, DEFAULT_FORMULA_FMT,
     apply_preset, matching_preset, preset_from_current,
+)
+from nba_compare.filters import (
+    GameFilter, Condition, GAME_FIELDS, SEASON_FIELDS, OPS, OP_SYMBOLS,
+    LOCATIONS, RESULTS, GAME_LENGTHS, OPPONENT_MODES, OPP_CONFERENCES,
+    PLAYOFF_ROUNDS, SERIES_HOME_COURT, SERIES_SITUATIONS,
 )
 from nba_compare.playoffs import (
     render_series_table_html, build_series_table, SERIES_COLUMN_DEFS, DEFAULT_SERIES_COLUMNS,
@@ -71,6 +76,11 @@ def directory_for(mode: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
+@st.cache_resource
+def get_team_abbreviations(league: str) -> list[str]:
+    return get_stores()[league].team_abbreviations()
+
+
 @st.cache_data
 def get_seasons(_store, player_id: int) -> list[int]:
     return _store.seasons_played(player_id)
@@ -111,6 +121,176 @@ if "span_order" not in st.session_state:
     st.session_state.span_order = []
 if "user_presets" not in st.session_state:
     st.session_state.user_presets = []  # list of {"name", "stats", "formulas"}
+# ---------- game filter state ----------
+# Two kinds of condition row: game conditions and whole-season qualifiers
+# (see filters.py). Each kind keeps its row list under its own state key, and
+# each row's widgets are keyed by kind prefix + row id. The value key
+# includes the field, so switching a row's field starts it at that field's
+# default (a W% of .500 makes no sense as a minutes cutoff).
+CONDITION_KINDS = {
+    # kind: (fields, row-list state key, widget key prefix, field a new row starts on)
+    "game": (GAME_FIELDS, "gf_conditions", "gfc", "MIN"),
+    "season": (SEASON_FIELDS, "gf_season_conditions", "gfs", "GP%"),
+}
+for _fields, _list_key, _prefix, _default in CONDITION_KINDS.values():
+    if _list_key not in st.session_state:
+        st.session_state[_list_key] = []  # list of {"id"}; field/op/value live in widget keys
+
+
+def _condition_value_key(prefix: str, cid: str, field: str) -> str:
+    return f"{prefix}_val_{cid}_{field}"
+
+
+def add_filter_condition(field: str | None = None, op: str | None = None, value: float | None = None,
+                         kind: str = "game"):
+    fields, list_key, prefix, default_field = CONDITION_KINDS[kind]
+    field = field or default_field
+    fd = fields[field]
+    cid = str(uuid.uuid4())
+    st.session_state[f"{prefix}_field_{cid}"] = field
+    st.session_state[f"{prefix}_op_{cid}"] = op or fd.default_op
+    st.session_state[_condition_value_key(prefix, cid, field)] = float(fd.default_value if value is None else value)
+    st.session_state[list_key].append({"id": cid})
+
+
+def remove_filter_condition(cid: str, kind: str = "game"):
+    list_key = CONDITION_KINDS[kind][1]
+    st.session_state[list_key] = [c for c in st.session_state[list_key] if c["id"] != cid]
+
+
+def _conditions_from_state(kind: str) -> tuple[Condition, ...]:
+    fields, list_key, prefix, _ = CONDITION_KINDS[kind]
+    out = []
+    for c in st.session_state[list_key]:
+        field = st.session_state.get(f"{prefix}_field_{c['id']}")
+        op = st.session_state.get(f"{prefix}_op_{c['id']}")
+        value = st.session_state.get(_condition_value_key(prefix, c["id"], field))
+        if field in fields and op in OPS and value is not None:
+            out.append(Condition(field, op, float(value)))
+    return tuple(out)
+
+
+def render_condition_rows(kind: str, add_label: str):
+    fields, list_key, prefix, _ = CONDITION_KINDS[kind]
+    for c in st.session_state[list_key]:
+        cid = c["id"]
+        row = st.columns([3, 1, 2, 1])
+        field = row[0].selectbox(
+            "Stat", list(fields), key=f"{prefix}_field_{cid}", label_visibility="collapsed",
+        )
+        fd = fields[field]
+        row[0].caption(fd.help)
+        row[1].selectbox(
+            "Op", list(OPS), key=f"{prefix}_op_{cid}", format_func=OP_SYMBOLS.get,
+            label_visibility="collapsed",
+        )
+        value_key = _condition_value_key(prefix, cid, field)
+        if value_key not in st.session_state:
+            st.session_state[value_key] = float(fd.default_value)
+        row[2].number_input(
+            "Value", key=value_key, step=fd.step, format=fd.fmt, label_visibility="collapsed",
+        )
+        row[3].button("✕", key=f"{prefix}_del_{cid}", on_click=remove_filter_condition, args=(cid, kind))
+    st.button(add_label, key=f"{prefix}_add", on_click=add_filter_condition, kwargs={"kind": kind})
+
+
+def _matching_condition_ids(field: str, op: str, value: float, kind: str) -> list[str]:
+    """Rows currently set to exactly this condition -- what makes a quick-add
+    button show as on. Editing a row's value makes it a custom condition, and
+    the button goes back to off."""
+    fields, list_key, prefix, _ = CONDITION_KINDS[kind]
+    return [
+        c["id"] for c in st.session_state[list_key]
+        if st.session_state.get(f"{prefix}_field_{c['id']}") == field
+        and st.session_state.get(f"{prefix}_op_{c['id']}") == op
+        and st.session_state.get(_condition_value_key(prefix, c["id"], field)) == float(value)
+    ]
+
+
+def toggle_quick_condition(field: str, op: str, value: float, kind: str):
+    matches = _matching_condition_ids(field, op, value, kind)
+    if matches:
+        for cid in matches:
+            remove_filter_condition(cid, kind)
+    else:
+        add_filter_condition(field, op, value, kind)
+
+
+def render_quick_buttons(quick: list[tuple], kind: str, per_row: int = 5):
+    """Toggle buttons: highlighted with a check while their condition is in
+    the list, and a second click takes it back out."""
+    for start in range(0, len(quick), per_row):
+        cols = st.columns(per_row)
+        for col, (text, field, op, value) in zip(cols, quick[start:start + per_row]):
+            on = bool(_matching_condition_ids(field, op, value, kind))
+            col.button(
+                f"✓ {text}" if on else text, key=f"gf_quick_{text}",
+                type="primary" if on else "secondary",
+                on_click=toggle_quick_condition, args=(field, op, value, kind),
+                help="Click again to remove." if on else None,
+                use_container_width=True,
+            )
+
+
+def set_game_filter_state(gf: GameFilter, enabled: bool = True):
+    """Puts a GameFilter into the filter widgets' state -- how Clear and Load
+    setup reach widgets that render further down the page."""
+    st.session_state.gf_conditions = []
+    st.session_state.gf_season_conditions = []
+    for c in gf.conditions:
+        add_filter_condition(c.field, c.op, c.value, "game")
+    for c in gf.season_conditions:
+        add_filter_condition(c.field, c.op, c.value, "season")
+    st.session_state.gf_location = gf.location
+    st.session_state.gf_result = gf.result
+    st.session_state.gf_length = gf.game_length
+    st.session_state.gf_opp_conf = gf.opp_conference
+    st.session_state.gf_opp_mode = gf.opponents_mode
+    st.session_state.gf_opponents = list(gf.opponents)
+    st.session_state.gf_po_rounds = list(gf.po_rounds)
+    st.session_state.gf_po_home = gf.po_home_court
+    st.session_state.gf_po_situation = gf.po_situation
+    st.session_state.gf_on = enabled
+
+
+def game_filter_from_state() -> GameFilter:
+    return GameFilter(
+        conditions=_conditions_from_state("game"),
+        season_conditions=_conditions_from_state("season"),
+        location=st.session_state.get("gf_location", "Any"),
+        result=st.session_state.get("gf_result", "Any"),
+        game_length=st.session_state.get("gf_length", "Any"),
+        opp_conference=st.session_state.get("gf_opp_conf", "Any"),
+        opponents=tuple(st.session_state.get("gf_opponents", [])),
+        opponents_mode=st.session_state.get("gf_opp_mode", "Only"),
+        po_rounds=tuple(sorted(st.session_state.get("gf_po_rounds", []))),
+        po_home_court=st.session_state.get("gf_po_home", "Any"),
+        po_situation=st.session_state.get("gf_po_situation", "Any"),
+    )
+
+
+# One click adds the condition; it's then editable like any other row.
+QUICK_FILTERS = [
+    ("Close games (≤ 10)", "|Margin|", "<=", 10),
+    ("Blowouts (≥ 20)", "|Margin|", ">=", 20),
+    ("vs. top-8 seeds", "Opp Seed", "<=", 8),
+    ("vs. winning teams", "Opp W%", ">=", 0.5),
+    ("Team top-8 seed", "Team Seed", "<=", 8),
+    ("Team .500+", "Team W%", ">=", 0.5),
+    ("30+ minutes", "MIN", ">=", 30),
+    ("Back-to-backs", "Rest days", "=", 0),
+    ("Rested (2+ days)", "Rest days", ">=", 2),
+]
+QUICK_PLAYOFF_FILTERS = [
+    ("Game 7s", "Series game #", "=", 7),
+    ("Trailing in series", "Series lead", "<", 0),
+    ("Game 1s", "Series game #", "=", 1),
+]
+QUICK_SEASON_FILTERS = [
+    ("Healthy seasons (GP% ≥ 60)", "GP%", ">=", 60),
+    ("Starter minutes (30+ MIN/G)", "MIN/G", ">=", 30),
+    ("Bench minutes (≤ 20 MIN/G)", "MIN/G", "<=", 20),
+]
 
 
 def add_span():
@@ -242,10 +422,10 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             duos=_build_duo_dicts_from_session(),
             stat_order=st.session_state.get("stat_order", []),
             custom_formulas=st.session_state.get("custom_formulas", []),
-            accolade_path=st.session_state.get("accolade_path_input", "") or "",
             user_presets=st.session_state.get("user_presets", []),
             head_to_head=st.session_state.get("h2h_mode", False),
             league_mode=league_mode,
+            game_filter={"enabled": st.session_state.get("gf_on", True), **game_filter_from_state().to_dict()},
         )
         st.session_state["_last_save_code"] = code
     if st.session_state.get("_last_save_code"):
@@ -351,10 +531,11 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             st.session_state.stat_order = restored_order or list(DEFAULT_STAT_LABELS)
             st.session_state.selected_stats = list(st.session_state.stat_order)
 
-            if cfg["accolade_path"]:
-                st.session_state["accolade_path_input"] = cfg["accolade_path"]
             st.session_state["h2h_mode"] = cfg["head_to_head"]
             st.session_state["_pending_league_mode"] = cfg["league_mode"]
+            set_game_filter_state(
+                GameFilter.from_dict(cfg["game_filter"]), enabled=cfg["game_filter"].get("enabled", True) is not False,
+            )
 
             msg = f"Loaded {len(new_span_cfgs)} span(s)."
             if skipped_players:
@@ -367,14 +548,6 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
                 msg += f" Dropped preset(s) (no stats left, or named like a built-in): {', '.join(dropped_presets)}."
             st.success(msg)
             st.rerun()
-
-st.sidebar.header("Accolades data (optional)")
-accolade_path = st.sidebar.text_input(
-    "Path to accolades CSV",
-    key="accolade_path_input",
-    help="See accolades.py for the expected columns. Leave blank to skip awards.",
-)
-accolade_store = AccoladeStore(accolade_path) if accolade_path else None
 
 # ---------- custom formulas ----------
 
@@ -659,6 +832,88 @@ if head_to_head:
                 for me, opp in ((a, b), (b, a))
             ]
 
+with st.expander("Game filters", expanded=False):
+    st.caption(
+        "Only count games that pass **every** condition below -- for all rows, regular season "
+        "and playoffs alike. Opponent W% and seed are the opponent's regular-season record "
+        "that season. In head-to-head, conditions are read from the first row's side "
+        "(a \"W\" is a game it won), and player conditions like MIN must hold for both rows."
+    )
+    if "gf_on" not in st.session_state:
+        st.session_state.gf_on = True
+    st.toggle("Apply game filters", key="gf_on",
+              help="Switch off to see the unfiltered numbers without losing the filters set up here.")
+
+    st.markdown("**Season qualifiers**")
+    st.caption(
+        "Keep or drop **whole seasons**, judged on the full regular season before any game "
+        "filter below (a duo: the games they shared). A dropped season loses its playoff games "
+        "too. Only availability and role are offered -- a cutoff on production like PTS/G would "
+        "guarantee the very number being compared."
+    )
+    render_quick_buttons(QUICK_SEASON_FILTERS, "season", per_row=3)
+    render_condition_rows("season", "+ Add season qualifier")
+
+    st.divider()
+    st.markdown("**Game conditions**")
+    st.caption("Quick add:")
+    render_quick_buttons(QUICK_FILTERS, "game")
+    render_condition_rows("game", "+ Add condition")
+
+    st.divider()
+    cat_cols = st.columns(3)
+    cat_cols[0].radio("Location", LOCATIONS, key="gf_location", horizontal=True)
+    cat_cols[1].radio("Result", RESULTS, key="gf_result", horizontal=True)
+    cat_cols[2].radio("Game length", GAME_LENGTHS, key="gf_length", horizontal=True)
+
+    opp_cols = st.columns([2, 1, 4])
+    opp_cols[0].radio(
+        "Opponent conference", OPP_CONFERENCES, key="gf_opp_conf", horizontal=True,
+        format_func=lambda c: {"Same": "Own conf.", "Other": "Other conf."}.get(c, c),
+        help="Uses today's conference alignment for every season (realignments like Milwaukee "
+             "moving East in 1980 aren't modeled), and teams from before the conference table's "
+             "coverage fail East/West.",
+    )
+    opp_cols[1].radio("Opponents", OPPONENT_MODES, key="gf_opp_mode",
+                      format_func=lambda m: "Only vs." if m == "Only" else "Exclude")
+    filter_leagues = {s.league for s in valid_spans} or (
+        set(data_config.LEAGUES) if league_mode == "Both" else {league_mode}
+    )
+    opp_options = sorted(
+        {abbr for lg in filter_leagues for abbr in get_team_abbreviations(lg)}
+        | set(st.session_state.get("gf_opponents", []))
+    )
+    opp_cols[2].multiselect(
+        "Teams", opp_options, key="gf_opponents", placeholder="Any opponent",
+        help="Abbreviations as they appeared at the time -- a relocated franchise is listed "
+             "under each of its names (e.g. SEA and OKC), so pick all you mean.",
+    )
+
+    st.divider()
+    st.markdown("**Playoff games**")
+    st.caption(
+        "These only narrow **playoff** games -- the regular-season table is untouched. Rounds count "
+        "back from the Finals, so *Last 4* is the conference finals in a 4-round NBA year and the "
+        "semifinals in the WNBA. A *closeout* game is one a win would clinch, an *elimination* game "
+        "one a loss would end; a Game 7 is both (*winner-take-all*). Series length is read off the "
+        "result (a 4-2 series was best-of-7)."
+    )
+    po_cols = st.columns([2, 1, 2])
+    po_cols[0].multiselect(
+        "Round", list(PLAYOFF_ROUNDS), key="gf_po_rounds", format_func=PLAYOFF_ROUNDS.get,
+        placeholder="Every round",
+    )
+    po_cols[1].radio("Series home court", SERIES_HOME_COURT, key="gf_po_home",
+                     help="Whether this row's team had home-court advantage in the series "
+                          "(hosted Game 1) -- not whether this game was at home; that's Location above.")
+    po_cols[2].radio("Series situation", SERIES_SITUATIONS, key="gf_po_situation", horizontal=True)
+    st.caption("Quick add -- each one adds a playoffs-only row under Game conditions above:")
+    render_quick_buttons(QUICK_PLAYOFF_FILTERS, "game", per_row=3)
+
+    st.button("Clear all filters", on_click=set_game_filter_state, args=(GameFilter(),))
+
+game_filter = game_filter_from_state() if st.session_state.get("gf_on", True) else GameFilter()
+
 if len(valid_spans) > 1:
     current_labels = [s.label for s in valid_spans]
     if len(current_labels) != len(set(current_labels)):
@@ -787,7 +1042,35 @@ else:
             cols[1].button("✕", key=f"del_user_preset_{p['name']}",
                            on_click=_delete_user_preset, args=(p["name"],))
 
-    result = compare_spans(valid_spans, stores)
+    result = compare_spans(valid_spans, stores, game_filter)
+    if game_filter.is_active:
+        unit = {"seasons": "seasons", "regular": "RS", "playoffs": "PO"}
+        kept = []
+        for agg in result.aggregates:
+            parts = [
+                f"{n:,} of {total:,} {unit[key]}"
+                for key, (n, total) in sorted(agg["filter_counts"].items(), key=lambda kv: list(unit).index(kv[0]))
+            ]
+            kept.append(f"{agg['label']}: {', '.join(parts)}")
+        if game_filter.narrows("regular"):
+            caveat = (
+                "%ile rows show — while game conditions are on, since they rank whole seasons, and the "
+                "playoff series breakdown lists only series with at least one game that passed."
+            )
+        elif game_filter.narrows("playoffs"):
+            caveat = (
+                "The playoff filters leave the regular season untouched. Playoff %ile rows show —, and "
+                "the playoff series breakdown lists only series with at least one game that passed."
+            )
+        else:
+            caveat = (
+                "Season qualifiers keep whole seasons, so %ile rows and the playoff series breakdown "
+                "still apply to the seasons kept."
+            )
+        st.info(
+            "**Game filter on** — " + " · ".join(game_filter.describe()) + "  \n"
+            + "Kept — " + "; ".join(kept) + "  \n" + caveat
+        )
     has_regular = any(agg["regular"] for agg in result.aggregates)
     has_playoffs = any(agg["playoffs"] for agg in result.aggregates)
     formats, lower_is_better = formats_and_lower_is_better(combined_stat_defs)
@@ -832,7 +1115,7 @@ else:
                 "**Team/Opp …/G** = the player's team's and its opponents' box score, per game, over "
                 "the games in this span. Each is averaged over the games that have it recorded; "
                 "before 1985 (NBA) most columns are rebuilt from player logs where possible, as are "
-                "WNBA team turnovers in 1997, 2000 and 2003 (marked *)."
+                "WNBA team turnovers in 1997, 2000 and 2003 (footnoted)."
             )
         if len({s.league for s in valid_spans}) > 1:
             st.caption(
@@ -950,10 +1233,3 @@ else:
                     unsafe_allow_html=True,
                 )
                 st.markdown("<br>", unsafe_allow_html=True)
-
-    awards_table = build_awards_table(valid_spans, accolade_store)
-    if awards_table is not None:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown(render_stat_table_html(awards_table, "Awards & Honors"), unsafe_allow_html=True)
-    elif accolade_store is None:
-        st.caption("No accolades CSV loaded — add one in the sidebar to show Awards & Honors.")

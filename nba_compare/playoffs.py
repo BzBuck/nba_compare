@@ -250,6 +250,65 @@ def _empty_series_stat_block() -> dict:
     }
 
 
+def playoff_game_context(store: NBADataStore, season: int) -> pd.DataFrame:
+    """
+    One row per team per playoff game that postseason, with where the game
+    sat in its series -- what the playoff game filters (filters.py) read:
+
+    - GAME_ID, TEAM_ID
+    - ROUNDS_FROM_FINALS: 0 = Finals, 1 = the round before (conference
+      finals / semifinals), ... -- counted back from that season's deepest
+      round, so it means the same thing across 2-, 3- and 4-round formats.
+    - SERIES_GAME: 1 for Game 1, ...
+    - SERIES_LEAD: this team's series wins minus losses BEFORE the game.
+    - HOME_COURT: True if this team hosted Game 1 of the series (see
+      _home_court_from_matchup).
+    - CLOSEOUT / ELIMINATION: a win would clinch the series / a loss would
+      end it. Both are True in a winner-take-all game (a Game 7), and in
+      any single-game series.
+
+    The series length isn't recorded anywhere, so the wins needed are read
+    off the result: a series that ended 4-2 was best-of-7, 3-1 best-of-5.
+    That holds for every completed series; one still in progress when the
+    data was pulled would understate it. Cached on the store per season.
+    """
+    cache_key = f"playoff_context_{season}"
+    if cache_key in store._cache:
+        return store._cache[cache_key]
+
+    cols = ["GAME_ID", "TEAM_ID", "ROUNDS_FROM_FINALS", "SERIES_GAME", "SERIES_LEAD",
+            "HOME_COURT", "CLOSEOUT", "ELIMINATION"]
+    team_games = store.team_games_for_season(season, "playoffs")
+    if team_games.empty:
+        store._cache[cache_key] = pd.DataFrame(columns=cols)
+        return store._cache[cache_key]
+
+    games = _league_rounds(team_games).sort_values("GAME_DATE", kind="stable")
+    series = games.groupby(["TEAM_ID", "SERIES_ID"], sort=False)
+    win = (games["WL"] == "W").astype(int)
+    loss = (games["WL"] == "L").astype(int)
+    wins_before = win.groupby([games["TEAM_ID"], games["SERIES_ID"]]).cumsum() - win
+    losses_before = loss.groupby([games["TEAM_ID"], games["SERIES_ID"]]).cumsum() - loss
+    needed = pd.concat(
+        [win.groupby([games["TEAM_ID"], games["SERIES_ID"]]).transform("sum"),
+         loss.groupby([games["TEAM_ID"], games["SERIES_ID"]]).transform("sum")], axis=1,
+    ).max(axis=1)
+    first_matchup = series["MATCHUP"].transform("first")
+
+    out = pd.DataFrame({
+        "GAME_ID": games["GAME_ID"],
+        "TEAM_ID": games["TEAM_ID"],
+        "ROUNDS_FROM_FINALS": int(games["ROUND"].max()) - games["ROUND"],
+        "SERIES_GAME": series.cumcount() + 1,
+        "SERIES_LEAD": wins_before - losses_before,
+        "HOME_COURT": first_matchup.map(_home_court_from_matchup) == "Home",
+        "CLOSEOUT": wins_before == needed - 1,
+        "ELIMINATION": losses_before == needed - 1,
+    }).reset_index(drop=True)
+    store._cache[cache_key] = out
+    return out
+
+
 def league_round_depth(store: NBADataStore, season: int) -> pd.DataFrame:
     """
     Rounds played and final-series result for EVERY team that made the
@@ -575,35 +634,50 @@ def estimate_conference_seed(store: NBADataStore, team_abbr: str, season: int) -
     not an authoritative seed number. Returns None if the team's
     conference/data can't be determined.
     """
+    standings = season_standings(store, season)
+    row = standings[standings["TEAM_ABBREVIATION"] == team_abbr]
+    if row.empty or pd.isna(row["seed"].iloc[0]):
+        return None
+    row = row.iloc[0]
+    return {"conference": row["conference"], "estimated_seed": int(row["seed"]),
+            "win_pct": float(row["win_pct"])}
+
+
+def season_standings(store: NBADataStore, season: int) -> pd.DataFrame:
+    """
+    Every team's regular-season record for one season: SEASON,
+    TEAM_ABBREVIATION, wins, games, win_pct, conference, seed. `seed` is the
+    same APPROXIMATE win%-rank-within-conference as estimate_conference_seed
+    (which reads it from here), and is NaN for a team the conference table
+    doesn't cover; win_pct is always filled. Cached on the store per season
+    -- the game filters (see filters.py) look up every opponent of a span.
+    """
+    cache_key = f"standings_{season}"
+    if cache_key in store._cache:
+        return store._cache[cache_key]
+
     reg = store.team_games_for_season(season, "regular")
     if reg.empty or "TEAM_ABBREVIATION" not in reg.columns:
-        return None
-
-    if store.league == "WNBA" and season >= WNBA_LEAGUEWIDE_SEEDING_FROM:
-        conf, conf_teams = "League", set(reg["TEAM_ABBREVIATION"])
+        records = pd.DataFrame(columns=["SEASON", "TEAM_ABBREVIATION", "wins", "games", "win_pct", "conference", "seed"])
     else:
-        conferences = CONFERENCES[store.league]
-        conf = next((c for c, teams in conferences.items() if team_abbr in teams), None)
-        if conf is None:
-            return None
-        conf_teams = conferences[conf]
-    conf_games = reg[reg["TEAM_ABBREVIATION"].isin(conf_teams)]
-    if conf_games.empty:
-        return None
-
-    records = conf_games.groupby("TEAM_ABBREVIATION").apply(
-        lambda g: pd.Series({"wins": (g["WL"] == "W").sum(), "games": len(g)}),
-        include_groups=False,
-    ).reset_index()
-    records["win_pct"] = records["wins"] / records["games"]
-    records = records.sort_values("win_pct", ascending=False).reset_index(drop=True)
-
-    match = records.index[records["TEAM_ABBREVIATION"] == team_abbr]
-    if len(match) == 0:
-        return None
-    seed = int(match[0]) + 1
-    return {"conference": conf, "estimated_seed": seed,
-            "win_pct": float(records.loc[match[0], "win_pct"])}
+        records = (
+            reg.assign(win=reg["WL"] == "W")
+            .groupby("TEAM_ABBREVIATION")["win"].agg(wins="sum", games="size")
+            .reset_index()
+        )
+        records["win_pct"] = records["wins"] / records["games"]
+        if store.league == "WNBA" and season >= WNBA_LEAGUEWIDE_SEEDING_FROM:
+            records["conference"] = "League"
+        else:
+            team_conf = {t: c for c, teams in CONFERENCES[store.league].items() for t in teams}
+            records["conference"] = records["TEAM_ABBREVIATION"].map(team_conf)
+        # Stable sort, so ties keep alphabetical order -- no real tiebreakers.
+        records = records.sort_values("win_pct", ascending=False, kind="stable")
+        records["seed"] = records.groupby("conference").cumcount().add(1).astype(float)
+        records.loc[records["conference"].isna(), "seed"] = float("nan")
+        records = records.assign(SEASON=season).reset_index(drop=True)
+    store._cache[cache_key] = records
+    return records
 
 
 def render_series_table_html(series_df: pd.DataFrame, columns: list[str] | None = None, title: str = "") -> str:

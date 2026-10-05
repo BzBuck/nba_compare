@@ -103,11 +103,15 @@ streamlit run app.py
   actually shared on the floor together, not their individual careers
   added up. A game only counts if both players logged real minutes in it
   (see "Duo mode" below for exactly what that means and how it interacts
-  with usage%, playoff series records, and awards).
+  with usage% and playoff series records).
 - **Head-to-head toggle**: with exactly two rows (players or duos), only
   count the games the two sides played *against* each other — both columns
   are built from the same games, and W/L becomes the head-to-head record.
   See "Head-to-head" below.
+- **Game filters**: optionally count only the games that pass conditions
+  you set — close games, games against top-8 seeds or winning teams,
+  nights with 30+ minutes, road wins, overtime games, specific opponents —
+  combined freely, for every row at once. See "Game filters" below.
 - **Season range slider** per span (single season, a few years, or full
   career), plus independent toggles for regular season / playoffs.
 - **Stat presets**: one click swaps the table to a themed set of rows —
@@ -147,8 +151,7 @@ Season and Playoffs tables. With exactly 2 columns, worst is never
 highlighted, since it'd just be "not green" shown louder; ties at either
 extreme aren't highlighted either. Short explanatory notes appear under the
 tables for whichever stat families are showing (/100, /75, CV%, %ile,
-Team/Opp, head-to-head, mixed leagues). An Awards & Honors table appears
-too, if you point the sidebar at an accolades CSV (see `accolades.py`).
+Team/Opp, head-to-head, mixed leagues).
 
 ## Quick test (no UI)
 
@@ -177,9 +180,10 @@ nba_compare/                        <- project root, cd here to work
     │   ├── playoffs.py              series/round/championship identification
     │   ├── percentiles.py           league percentile ranks per season
     │   ├── formulas.py              safe evaluator for custom formulas
+    │   ├── filters.py               optional game filters (close games, vs. top seeds, ...)
     │   ├── session_config.py        save/load format for app setups
     │   ├── players.py               player search helper for the UI
-    │   ├── accolades.py             pluggable Awards & Honors source
+    │   ├── accolades.py             awards data model -- groundwork, not in the app yet
     │   ├── viz.py                   Plotly charts (library-level, see below)
     │   └── config.py                where the parquet files come from, per league
     ├── app.py                       Streamlit UI, run this
@@ -196,9 +200,20 @@ from the project root, with nothing to install or put on the path.
 
 Everything below lives in `table.STAT_DEFS`, one dict entry per row, so
 adding/renaming a stat is a one-line change in `table.py`. All are
-toggleable/reorderable in the app; the • ones are on by default. (A • means
-something else entirely and never appears here — in the rendered table it
-marks a value built from rebuilt team data; see "Per 100 possessions" below.)
+toggleable/reorderable in the app; the • ones are on by default.
+
+In the rendered table, a small superscript number on a value points to a
+numbered footnote under that table. Numbers are assigned per table in the
+order the caveats appear, and only the footnotes a table uses are shown.
+There are two kinds:
+
+- **Rebuilt team data**: the value comes from team box scores rebuilt out
+  of player rows. See "Per 100 possessions" below.
+- **Partial plus-minus**: plus-minus wasn't recorded before NBA 1996-97 or
+  WNBA 2008, so `+/-` and `+/- Std Dev` for a span reaching earlier are
+  averaged over only the later games. The footnote gives each span's count,
+  e.g. Jordan's career is 306 of 1,072. A span with none recorded shows `—`
+  instead.
 
 **Box score** — •GP, •W, •L, •MIN/G, •PTS/G, •TRB/G, ORB/G, DRB/G, •AST/G, •STL/G,
 •BLK/G, •TOV/G, •PF/G, •+/-
@@ -230,7 +245,7 @@ PTS/G, TRB/G, ORB/G, DRB/G, AST/G, STL/G, BLK/G, TOV/G, PF/G, FGM/G, FGA/G,
 3PM/G, 3PA/G, FTM/G, FTA/G. Labeled like the player's own rows ("Team AST/G"
 next to "AST/G") so formulas such as AST% read the way Basketball-Reference
 writes them. Each is averaged over the games that have it recorded; a column
-rebuilt from player logs gets its own `*`.
+rebuilt from player logs gets its own rebuilt-data footnote.
 
 **Consistency** — MIN/PTS/TRB/AST/STL/BLK/TOV/3PM/FGM/FTM/TSA/Usage
 Vol/TS% CV% (coefficient of variation — see below), plus
@@ -278,7 +293,7 @@ just qualifying players. Unlike percentiles (below), this is meaningful
 for a **Duo** span too, since it's plain subtraction against a league
 baseline rather than a rank against a distribution of individual players.
 
-### Per 100 possessions — and what the `*` means
+### Per 100 possessions — and the rebuilt-data footnote
 
 `/100` rows are Basketball-Reference's "Per 100 Poss": the stat per 100 team
 possessions the player was on the floor for. A box score never records how
@@ -311,7 +326,7 @@ per-36 multiplied by a constant, which adds exactly zero information while
 Basketball-Reference declines to publish pace before 1973-74 for the same
 reason. Where the possessions can't be estimated, these rows show `—`.
 
-**Era coverage, and the `*`.** The team logs only carry FGA/FTA/TOV/OREB from
+**Era coverage, and the footnote.** The team logs only carry FGA/FTA/TOV/OREB from
 **1985** onward. Before that they're empty, which would blank out every
 per-100 row (and Pace/ORtg/DRtg, as it always has). But the *player* logs
 reach further back for some of those columns, so where the official team line
@@ -321,12 +336,12 @@ row in the game has it, and only when the summed player minutes match the
 official team minutes (which is how a partial roster gets rejected, and how
 overtime games pass automatically).
 
-| Seasons | Source | Marked |
+| Seasons | Source | Footnoted |
 |---|---|---|
 | NBA 1985– | official team box scores | no |
-| NBA 1977–1984 | rebuilt from summed player rows | `*` |
+| NBA 1977–1984 | rebuilt from summed player rows | yes |
 | NBA –1976 | not computable at all | shows `—` |
-| WNBA 1997, 2000, 2003 | team turnovers rebuilt from summed player rows | `*` |
+| WNBA 1997, 2000, 2003 | team turnovers rebuilt from summed player rows | yes |
 | WNBA, every other season | official team box scores | no |
 
 The WNBA team logs record team turnovers as `0` for every game of 1997, 2000
@@ -337,8 +352,8 @@ replaced by the players' summed minutes where they add up to a full game —
 see `data._repair_team_lines`. Without that, USG%, per-100 and pace would
 divide by zero for the league's first seasons.
 
-Anything resting on a rebuilt line gets a **`*`** next to it in the table, with
-a footnote. Two reasons it's a caveat and not just a footnote of pedantry:
+Anything resting on a rebuilt line gets a footnote number next to it in the
+table. Two reasons it's a caveat and not just a footnote of pedantry:
 coverage inside 1977-1984 is partial (roughly 35% of games in the thinnest
 seasons up to ~93% in 1983) and clusters by team, and team turnovers that
 aren't charged to any individual player are missing from the sum, which makes
@@ -377,7 +392,7 @@ league's pace reads on its own familiar scale.
 
 These used to come back blank for every season before 1985, since the team
 logs have no possession columns that far back. They now fill in for roughly
-1977-1984 from rebuilt team lines, marked with a `*` — see "Per 100
+1977-1984 from rebuilt team lines, footnoted — see "Per 100
 possessions" above.
 
 **Individual (player-level) ORtg/DRtg are NOT implemented.** The real
@@ -564,9 +579,6 @@ added up.
   use each half's own W/L" under "Playoff depth & series" above.
 - **Both players must be from the same league** — a cross-league pair
   shows "Different leagues -- never teammates" in Both mode.
-- **Awards & Honors** are season-level data, not game-level, so a Duo's
-  row is simply both players' individual awards summed over the span's
-  seasons — not scoped to games they shared the way every other stat here is.
 
 ## Head-to-head
 
@@ -590,6 +602,111 @@ each other.
   otherwise show up as "(DNP)".
 - Needs two rows with no player in common, from the same league — the app
   explains and falls back to the normal comparison otherwise.
+
+## Game filters
+
+The **Game filters** expander (under the player rows) narrows which games
+every number is built from — each row, regular season and playoffs alike.
+A game counts only if it passes **every** part of the filter:
+
+- **Conditions** — any number of `field  op  value` rows (≥ ≤ > < = ≠).
+  The quick-add buttons drop in the common ones (Close games `|Margin| ≤ 10`,
+  Blowouts `|Margin| ≥ 20`, vs. top-8 seeds, vs. winning teams, team top-8
+  seed, team .500+, 30+ minutes, back-to-backs, rested 2+ days), which you can then edit like any
+  other row.
+
+  | Field | Means |
+  |---|---|
+  | MIN, PTS, TRB, AST, STL, BLK, TOV, 3PM, FGA, +/- | the row's own line that game (a duo's combined — except MIN, which each player in a duo must meet) |
+  | Margin | final margin from the row's team's side: +12 won by 12, −5 lost by 5 |
+  | \|Margin\| | final margin either way |
+  | Opp W% | the opponent's regular-season win% that season |
+  | Opp Seed | the opponent's approximate conference seed that season (see "Playoff depth & series" for the approximation) |
+  | Team W%, Team Seed | the row's **own** team's regular-season win% / approximate seed that season, game by game — so "Team W% ≥ .600" keeps only the years on a contender, and a mid-season trade is judged by the team each game was for |
+  | Rest days | full days off since the row's team's previous game — 0 is a back-to-back; a season opener has none (a playoff opener counts from the end of the regular season) |
+  | Series game #, Series lead | *playoffs only*: which game of the series, and the row's team's series wins minus losses before it (< 0 trailing). Regular-season games ignore these conditions rather than failing them |
+  | Team PTS, Opp PTS | points scored by each side |
+
+- **Season qualifiers**: keep or drop *whole seasons*, using availability
+  and role only. The fields are **GP**, **GP%** (games played as a % of that
+  season's schedule: 82 in most NBA years, 66 in 2011-12, 34–44 in the
+  WNBA) and **MIN/G**. Quick-adds: healthy seasons (GP% ≥ 60), starter
+  minutes (30+ MIN/G), bench minutes (≤ 20 MIN/G).
+  - **Judged on the full regular season**, before any game condition. So
+    "close games only" can't knock a season out for being under the GP
+    cutoff, and in head-to-head a season counts on each side's own season,
+    not on three or four meetings. A duo is judged on its shared games, and
+    MIN/G must hold for each player.
+  - **A dropped season loses its playoff games too.** Jordan with GP% ≥ 60
+    loses 1985-86 (18 games) and 1994-95 (17), keeping 13 of 15 seasons
+    and all six titles.
+  - **Use GP% to compare across leagues.** A raw `GP ≥ 50` drops every
+    WNBA season.
+  - **%ile rows stay** under a season-only filter, since whole seasons are
+    what they rank.
+  - **There are no production cutoffs (PTS/G ≥ 25 and the like) on
+    purpose.** They would guarantee the very rows being compared.
+- **Location** (Home / Away), **Result** (W / L), **Game length**
+  (Regulation / Overtime — read from team minutes, which the NBA logs
+  don't reliably have before 1963-64, so those games pass neither).
+- **Opponent conference** — East, West, own conference or other conference.
+  It uses the same fixed conference table as the seed estimate, i.e. today's
+  alignment for every season, so realignments (Milwaukee moving East in
+  1980, ...) aren't modeled, and pre-merger teams the table doesn't list
+  fail it.
+- **Opponents** — only vs., or excluding, a list of teams. Abbreviations are
+  as they were at the time, so a relocated franchise appears under each name
+  (SEA and OKC); pick all you mean.
+
+- **Playoff games**: these narrow *only* playoff games. The regular-season
+  table, and its %ile rows, are untouched.
+  - **Round** is counted back from that season's Finals: Finals, Last 4,
+    Last 8, Last 16. So "Last 4" is the conference finals in a 4-round NBA
+    year, the semifinals in the WNBA, and round 2 of a 3-round year. It
+    uses the same league-wide round numbering as the series breakdown,
+    byes included.
+  - **Series home court**: with / without home-court advantage in the
+    series (hosted Game 1). This isn't the same as Location, which is
+    about the game itself.
+  - **Series situation**:
+    - *Closeout*: a win would clinch the series.
+    - *Elimination*: a loss would end it.
+    - *Either*: closeout or elimination.
+    - *Winner-take-all*: both at once, e.g. a Game 7, or any single-game
+      round.
+  - **Series length** isn't recorded, so it's read off the result: a series
+    that ended 4–2 was best-of-7, and 3–1 was best-of-5. That's right for
+    every completed series.
+  - **Quick-adds**: Game 7s, trailing in series, Game 1s.
+  - **Check**: LeBron's career gives 55 Finals games, 8 winner-take-all
+    games (his eight Game 7s), and a 6–6 record in Finals elimination games.
+
+There's no starter/bench split: the game logs have no starting-lineup
+column, and guessing starters from minutes would just be a minutes filter.
+
+A game whose field is unknown fails that condition rather than slipping
+through — `+/-` isn't recorded before NBA 1996-97 (WNBA 2008), so a `+/-`
+condition drops every earlier game. Playoff opponents are ranked by their regular season,
+so "vs. top-8 seeds" in the playoffs keeps nearly everything.
+
+While a filter is on, a note above the tables lists it and how many
+seasons and games each row kept. While a *game* condition is on, two things
+change for the season type it narrows (the playoff-only parts narrow only
+the playoffs), for the same reasons as in head-to-head: **%ile rows show —** (they rank whole seasons, not these
+games), and the **playoff series breakdown** — and the Championships /
+Series W / Finals Apps rows built from it — counts only series with at
+least one game that passed. A filter on your own box score (PTS ≥ 30)
+is allowed, but the averages it produces are selected on the very thing
+they measure, so read them as "in games like this", not as a skill.
+
+**With head-to-head**, the filter is read from the **first** row's side
+(Result W = games the first row won, Opp Seed = the second row's team), and
+player conditions must hold for **both** rows (MIN ≥ 35 = everyone played
+35+). That keeps both columns built from the same games — applying it to
+each side separately would, for a "Wins" filter, keep opposite games.
+
+The **Apply game filters** toggle switches the filter off without losing
+it, and the filter is kept in save codes.
 
 ## Stat presets
 
@@ -667,9 +784,9 @@ lowest value as the best.
 
 Sidebar → "Save / Load setup" → **Generate save code** produces a compact
 text blob (or downloadable file) capturing your players and duos,
-seasons, league (NBA / WNBA / Both), head-to-head setting, stat
+seasons, league (NBA / WNBA / Both), head-to-head setting, game filters, stat
 selection/order, custom formulas (with their decimals and lower-is-better
-flag), saved presets, and accolades path. Paste it back in — in the same
+flag), and saved presets. Paste it back in — in the same
 session or a completely different one — and **Load setup** rebuilds
 everything, switching the league picker to the one the save was made in.
 
@@ -685,9 +802,10 @@ This is designed to survive future edits to the code, not just work today:
   references a variable that no longer exists, it's silently dropped (and
   reported to you) instead of crashing the whole load. Saved presets get
   the same check, and one left with no valid rows is dropped.
-- The format is versioned (`session_config.CONFIG_VERSION`, currently 3).
+- The format is versioned (`session_config.CONFIG_VERSION`, currently 4).
   Older saves load unchanged: a save from before league support loads as
-  NBA.
+  NBA, and one from before game filters loads with none. A saved filter
+  condition on a field that's since been renamed is dropped, like a stat.
 
 ## Using it as a library (outside the app)
 
@@ -723,6 +841,19 @@ spans = [
     PlayerSpan(1628932, "A'ja Wilson", [2024], league="WNBA"),
 ]
 result = compare_spans(spans, stores)
+```
+
+Game filters are a `filters.GameFilter` passed to `compare_spans`:
+
+```python
+from nba_compare.filters import GameFilter, Condition
+
+close_vs_good = GameFilter(
+    conditions=(Condition("|Margin|", "<=", 10), Condition("Opp Seed", "<=", 8)),
+    location="Away",            # or "Home"; result="W"/"L"; game_length="Overtime"/"Regulation"
+)
+result = compare_spans(spans, store, close_vs_good)
+result.aggregates[0]["filter_counts"]   # {"regular": (games kept, games before), "playoffs": ...}
 ```
 
 Head-to-head is the same span with `vs_player_ids` (and optionally

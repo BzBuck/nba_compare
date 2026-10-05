@@ -6,6 +6,7 @@ highlighted -- rather than the grouped-bar-chart approach.
 Kept separate from viz.py since this renders as HTML/dataframe, not Plotly.
 """
 from __future__ import annotations
+import html
 import pandas as pd
 from .compare import ComparisonResult
 from .data import TEAM_BOX_STATS
@@ -150,12 +151,17 @@ DEFAULT_STAT_LABELS = [
 ROW_FORMATS = {label: fmt for label, (_getter, fmt, _lower) in STAT_DEFS.items()}
 LOWER_IS_BETTER = {label for label, (_getter, _fmt, lower) in STAT_DEFS.items() if lower}
 
-# Footnote marker for a value that rests on rebuilt team box-score lines
-# rather than the official ones -- see ESTIMATED_SOURCES and data.py's
+# Cells can carry a numbered footnote (superscript 1, 2, ... under the
+# table), one per KIND of caveat. Numbers are handed out per table in the
+# order the caveats first appear, so a table only ever shows the notes it
+# uses, numbered from 1.
+#
+# ESTIMATED: a value that rests on rebuilt team box-score lines rather than
+# the official ones -- see ESTIMATED_SOURCES and data.py's
 # _reconstructed_team_lines. In practice this means 1977-1984.
-ESTIMATED_MARK = "*"
+ESTIMATED = "estimated"
 ESTIMATED_NOTE = (
-    "* Built from team box-score lines rebuilt by summing each game's individual "
+    "Built from team box-score lines rebuilt by summing each game's individual "
     "player rows \u2014 the official team logs are missing most box-score columns before 1985. "
     "Covers only part of each 1977\u20131984 season, and misses team turnovers that "
     "aren't charged to a player, so treat these as close estimates rather than "
@@ -186,8 +192,52 @@ ESTIMATED_SOURCES = {
 }
 
 
+# PARTIAL: a value averaged over only SOME of the span's games, because the
+# stat wasn't recorded for the rest. Its footnote lists each marked span's
+# game count.
+PARTIAL = "partial"
+PARTIAL_NOTE = (
+    "Plus-minus wasn't recorded before 1996-97 in the NBA (2008 in the WNBA), so for a "
+    "span reaching earlier it's averaged over only the games that have it:"
+)
+FOOTNOTES = {ESTIMATED: ESTIMATED_NOTE, PARTIAL: PARTIAL_NOTE}
+
+# Small and faint, so a footnote number beside a stat reads as a marker and
+# not an exponent (the browser default is ~83% size, full strength); line-
+# height 0 keeps a marked cell from growing taller than its row.
+FOOTNOTE_MARK_STYLE = "font-size:.6em;opacity:.55;margin-left:2px;line-height:0;"
+
+# Rows that can carry the PARTIAL footnote -> the stat-block key holding (games
+# with the stat, games in the span).
+PARTIAL_SOURCES = {
+    "+/-": "plus_minus_coverage",
+    "+/- Std Dev": "plus_minus_coverage",
+}
+
+
+def _partial_coverage(block: dict | None, label: str) -> tuple[int, int] | None:
+    """(games with the stat, games) when this row's value covers only some
+    of the span's games, else None. A span with NONE of them recorded isn't
+    partial -- its value is simply missing and shows \u2014."""
+    key = PARTIAL_SOURCES.get(label)
+    if block is None or key is None or not block.get(key):
+        return None
+    recorded, games = block[key]
+    return (recorded, games) if 0 < recorded < games else None
+
+
+def _cell_mark(block: dict | None, label: str) -> tuple[str, str | None] | None:
+    """(footnote kind, detail for this span) for its value in this row, or None."""
+    if _is_estimated(block, label):
+        return (ESTIMATED, None)
+    partial = _partial_coverage(block, label)
+    if partial:
+        return (PARTIAL, f"{partial[0]:,} of {partial[1]:,} games")
+    return None
+
+
 def _is_estimated(block: dict | None, label: str) -> bool:
-    """Whether this span's value for this row should carry ESTIMATED_MARK.
+    """Whether this span's value for this row should carry the ESTIMATED footnote.
     A (source, key) entry reads a per-column flag -- the team_box block
     tracks "estimated" separately for each of its columns."""
     source = ESTIMATED_SOURCES.get(label)
@@ -236,9 +286,12 @@ def build_stat_flags(
     stat_defs: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Booleans in the SAME shape and order as build_stat_table: True where that
-    span's value for that row came out of rebuilt team box-score lines and so
-    should be marked. Pass to render_stat_table_html(flags=...).
+    Same shape and order as build_stat_table, holding (footnote kind, detail)
+    where that span's value for that row should be footnoted and None where
+    it shouldn't: ESTIMATED for a value built from rebuilt team box-score
+    lines, PARTIAL for one averaged over only part of the span's games
+    (plus-minus before it was recorded). Pass to
+    render_stat_table_html(flags=...).
 
     Built as a separate frame rather than as part of the table because
     build_stat_table has to stay purely numeric -- that's what the best/worst
@@ -252,7 +305,7 @@ def build_stat_flags(
     for agg in result.aggregates:
         block = agg[season_type]
         data[agg["label"]] = {
-            label: _is_estimated(block, label)
+            label: _cell_mark(block, label)
             for label in stat_labels if label in stat_defs
         }
     return pd.DataFrame(data).reindex([l for l in stat_labels if l in stat_defs])
@@ -287,20 +340,26 @@ def render_stat_table_html(
     output of formats_and_lower_is_better(your_stat_defs) for a table built
     from a different/merged stat_defs (e.g. including custom formulas).
 
-    flags (from build_stat_flags, same shape as df) marks the cells whose
-    value rests on rebuilt team data with ESTIMATED_MARK, and appends
-    ESTIMATED_NOTE under the table -- only when at least one cell is
-    actually marked, so tables of purely official numbers stay clean.
+    flags (from build_stat_flags, same shape as df) puts a superscript
+    footnote number on each flagged cell and the numbered notes under the
+    table -- numbered in order of first appearance, and only the notes
+    actually used, so tables of complete, official numbers stay clean.
+    PARTIAL_NOTE is followed by each footnoted column's detail (its game
+    count). A plain True flag means ESTIMATED.
     """
     formats = formats if formats is not None else ROW_FORMATS
     lower_is_better = lower_is_better if lower_is_better is not None else LOWER_IS_BETTER
 
-    def is_flagged(row_label, col):
+    def mark_for(row_label, col):
         if flags is None or row_label not in flags.index or col not in flags.columns:
-            return False
-        return bool(flags.at[row_label, col])
+            return None
+        flag = flags.at[row_label, col]
+        if flag is True:
+            return (ESTIMATED, None)
+        return flag if isinstance(flag, tuple) else None
 
-    any_flagged = False
+    numbers: dict[str, int] = {}             # footnote kind -> its number in this table
+    details: dict[str, dict[str, str]] = {}  # footnote kind -> {column: detail}
 
     def fmt_cell(row_label, value):
         if value is None or pd.isna(value):
@@ -324,9 +383,13 @@ def render_stat_table_html(
         for col in df.columns:
             v = values[col]
             text = fmt_cell(row_label, v)
-            if v is not None and not pd.isna(v) and is_flagged(row_label, col):
-                any_flagged = True
-                text += f'<span style="opacity:.7;margin-left:1px;">{ESTIMATED_MARK}</span>'
+            mark = mark_for(row_label, col) if v is not None and not pd.isna(v) else None
+            if mark:
+                kind, detail = mark
+                number = numbers.setdefault(kind, len(numbers) + 1)
+                if detail:
+                    details.setdefault(kind, {})[col] = detail
+                text += f'<sup style="{FOOTNOTE_MARK_STYLE}">{number}</sup>'
             is_best = best is not None and v == best
             is_worst = (not is_best) and worst is not None and v == worst
             if is_best:
@@ -346,10 +409,17 @@ def render_stat_table_html(
         f'<th style="padding:5px 14px;text-align:left;color:#eee;border-bottom:1px solid #333;">{c}</th>'
         for c in df.columns
     )
-    note_html = (
+    notes = []
+    for kind, number in sorted(numbers.items(), key=lambda kv: kv[1]):
+        note = FOOTNOTES[kind]
+        per_col = details.get(kind)
+        if per_col:
+            note += " " + "; ".join(f"{html.escape(str(c))}: {d}" for c, d in per_col.items()) + "."
+        notes.append(f"<sup>{number}</sup> {note}")
+    note_html = "".join(
         f'<div style="margin-top:8px;color:#888;font-size:.8em;max-width:820px;line-height:1.45;">'
-        f'{ESTIMATED_NOTE}</div>'
-        if any_flagged else ''
+        f'{note}</div>'
+        for note in notes
     )
     return f"""
     <div style="font-family:-apple-system,sans-serif;">
@@ -384,8 +454,9 @@ def _sum_accolade_blocks(a: dict, b: dict) -> dict:
 
 def build_awards_table(spans, accolade_store) -> pd.DataFrame | None:
     """
-    Returns None if the accolade store has no data loaded (default state --
-    see accolades.py for how to wire in a real source). Awards are
+    Not used by the app yet -- kept for the planned awards table (see
+    accolades.py). Returns None if the accolade store has no data loaded
+    (default state -- see accolades.py for how to wire in a real source). Awards are
     season-level, not game-level, data -- so a DuoSpan's row is simply both
     players' individual awards summed over the span's seasons, not scoped
     to games they shared as teammates the way the box-score stats are.
