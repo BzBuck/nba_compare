@@ -13,11 +13,29 @@ new built-ins: they'd otherwise pile dozens more names into the variable
 list that every custom formula has to be written against. A preset adds its
 formulas when it's picked and takes them back out when another one is
 (see apply_preset), so they only take up room while they're in use.
+
+User presets are kept in a JSON file on disk (user_presets_path) so they
+survive a refresh or restart: read once when a session starts, rewritten
+whenever one is saved or deleted. The file holds the same preset shape a
+save code carries, and goes through the same lenient reading
+(session_config.read_user_presets) plus restore_user_presets' check
+against the current stats -- so a file written by an older version of the
+app still loads, minus whatever no longer exists.
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+from pathlib import Path
+
 from .formulas import validate_formula
+from .session_config import read_user_presets
 from .table import STAT_DEFS, DEFAULT_STAT_LABELS
+
+PRESETS_FILE_ENV = "NBA_COMPARE_PRESETS_FILE"
+DEFAULT_PRESETS_FILE = Path.home() / ".nba_compare" / "presets.json"
+PRESETS_FILE_VERSION = 1
 
 # The format a formula without one displays with -- what every custom
 # formula used before formulas could carry their own.
@@ -89,6 +107,8 @@ PRESET_FORMULAS: dict[str, dict] = {
     "STL%": _f(f"100 * STL/G * {_FLOOR} / (Opp FGA/G - Opp ORB/G + Opp TOV/G + 0.44 * Opp FTA/G)"),
     "BLK%": _f(f"100 * BLK/G * {_FLOOR} / (Opp FGA/G - Opp 3PA/G)"),
     "PTS%": _f(f"100 * PTS/G * {_FLOOR} / Team PTS/G"),
+    # Win Shares, offense plus defense (see win_shares.py).
+    "WS": _f("OWS + DWS"),
     # John Hollinger's Game Score, from per-game averages.
     "GmSc": _f(
         "PTS/G + 0.4 * FGM/G - 0.7 * FGA/G - 0.4 * (FTA/G - FTM/G) + 0.7 * ORB/G"
@@ -118,7 +138,7 @@ _PRESET_STATS: dict[str, list[str]] = {
     "Advanced": [
         "GP", "MIN/G", "TS%", "eFG%", "3PAr", "FTr",
         "PTS%", "ORB%", "DRB%", "TRB%", "AST%", "STL%", "BLK%", "TOV%", "USG%", "MIN%",
-        "GmSc", "PANTS",
+        "GmSc", "PANTS", "OWS", "DWS", "WS", "WS/48",
     ],
     "Team impact": [
         "GP", "W", "L", "Team W%", "Team MOV", "Team ORtg", "Team DRtg", "Net Rtg",
@@ -216,3 +236,80 @@ def preset_from_current(name: str, stat_order: list[str], custom_formulas: list[
             for f in custom_formulas if f["label"] in shown
         ],
     }
+
+
+def restore_user_presets(presets: list[dict]) -> tuple[list[dict], list[str]]:
+    """
+    (presets still usable, names dropped) for user presets read from a save
+    code or the presets file. Each preset's formulas are re-validated
+    against the current formula engine and its rows narrowed to ones that
+    still exist; a preset left with no rows, or named like a built-in
+    (which always wins), is dropped. A later preset with the same name
+    replaces an earlier one.
+    """
+    sample_vars = {v: 1.0 for v in STAT_DEFS}
+    kept: dict[str, dict] = {}
+    dropped = []
+    for p in presets:
+        formulas = [f for f in p["formulas"] if not validate_formula(f["expr"], sample_vars)]
+        valid = set(STAT_DEFS) | {f["label"] for f in formulas}
+        stats = [x for x in p["stats"] if x in valid]
+        if not stats or p["name"] in BUILTIN_PRESET_NAMES:
+            dropped.append(p["name"])
+            continue
+        kept.pop(p["name"], None)  # re-insert, so a replacement takes the later spot
+        kept[p["name"]] = {**p, "stats": stats, "formulas": formulas}
+    return list(kept.values()), dropped
+
+
+def user_presets_path() -> Path:
+    """Where user presets are kept: $NBA_COMPARE_PRESETS_FILE, or
+    ~/.nba_compare/presets.json."""
+    override = os.environ.get(PRESETS_FILE_ENV)
+    return Path(override).expanduser() if override else DEFAULT_PRESETS_FILE
+
+
+def presets_to_json(presets: list[dict]) -> str:
+    return json.dumps({"version": PRESETS_FILE_VERSION, "presets": presets}, indent=2)
+
+
+def presets_from_json(text: str | bytes) -> tuple[list[dict], list[str]]:
+    """(presets, names dropped) from a presets file's contents -- the
+    {"version", "presets"} object presets_to_json writes, or a bare list.
+    Raises ValueError, with a message safe to show, if it isn't JSON."""
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(f"Not a presets file ({e}).") from e
+    if isinstance(raw, dict):
+        raw = raw.get("presets", [])
+    return restore_user_presets(read_user_presets(raw))
+
+
+def load_user_presets(path: Path | None = None) -> tuple[list[dict], list[str], str | None]:
+    """(presets, names dropped, error message) from the presets file. A
+    missing file is just no presets yet; an unreadable one is reported and
+    left alone, so it isn't overwritten before someone can look at it."""
+    path = path or user_presets_path()
+    if not path.exists():
+        return [], [], None
+    try:
+        presets, dropped = presets_from_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [], [], f"Couldn't read saved presets from {path}: {e}"
+    return presets, dropped, None
+
+
+def save_user_presets(presets: list[dict], path: Path | None = None) -> str | None:
+    """Writes the presets file, replacing it in one step (a crash mid-write
+    can't leave half a file). Returns an error message, or None."""
+    path = path or user_presets_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".presets-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(presets_to_json(presets))
+        os.replace(tmp, path)
+    except OSError as e:
+        return f"Couldn't save presets to {path}: {e}"
+    return None

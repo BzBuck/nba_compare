@@ -329,6 +329,41 @@ def league_round_depth(store: NBADataStore, season: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def season_playoff_finish(store: NBADataStore, season: int) -> pd.DataFrame:
+    """
+    How far every playoff team got that postseason: TEAM_ABBREVIATION,
+    ROUNDS_FROM_FINALS of its last series (0 = reached the Finals, 1 = the
+    round before, ... -- same count as playoff_game_context) and CHAMPION.
+    Teams that missed the playoffs aren't listed; an empty frame means the
+    data has no postseason for that season. Cached on the store per season
+    -- the season-finish game filters (filters.py) look up every game's team.
+    """
+    cache_key = f"playoff_finish_{season}"
+    if cache_key in store._cache:
+        return store._cache[cache_key]
+
+    cols = ["TEAM_ABBREVIATION", "ROUNDS_FROM_FINALS", "CHAMPION"]
+    team_games = store.team_games_for_season(season, "playoffs")
+    if team_games.empty:
+        store._cache[cache_key] = pd.DataFrame(columns=cols)
+        return store._cache[cache_key]
+
+    games = _league_rounds(team_games)
+    deepest = int(games["ROUND"].max())
+    last = games[games["ROUND"] == games.groupby("TEAM_ID")["ROUND"].transform("max")]
+    out = (
+        last.assign(win=last["WL"] == "W", loss=last["WL"] == "L")
+        .groupby("TEAM_ID")
+        .agg(TEAM_ABBREVIATION=("TEAM_ABBREVIATION", "first"), ROUND=("ROUND", "first"),
+             wins=("win", "sum"), losses=("loss", "sum"))
+        .reset_index(drop=True)
+    )
+    out["ROUNDS_FROM_FINALS"] = deepest - out["ROUND"]
+    out["CHAMPION"] = (out["ROUNDS_FROM_FINALS"] == 0) & (out["wins"] > out["losses"])
+    store._cache[cache_key] = out[cols]
+    return store._cache[cache_key]
+
+
 def season_champion_team_id(store: NBADataStore, season: int) -> int | None:
     """None if the data for that season is missing/ambiguous (won't guess)."""
     depth = league_round_depth(store, season)

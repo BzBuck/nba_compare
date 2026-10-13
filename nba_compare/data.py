@@ -289,6 +289,33 @@ class NBADataStore:
         df = self._load(key)
         return df[df.SEASON == season]
 
+    def team_games_with_opponents(self, season: int, season_type: str = "regular") -> pd.DataFrame:
+        """
+        Every team game of one season, one row per team per game: TEAM_MIN
+        and TEAM_<stat>, joined with that game's opponent line as OPP_MIN and
+        OPP_<stat> -- the same columns games_with_team_context() gives one
+        player's games, for the whole league. Gaps are filled from rebuilt
+        team lines the same way (and TEAM_EST set the same way). For league
+        constants that need both sides of every game, like league pace.
+        """
+        cache_key = f"team_opp_{season_type}"
+        if cache_key not in self._cache:
+            team_df = self._load("team_regular" if season_type == "regular" else "team_playoffs")
+            cols = ["GAME_ID", "TEAM_ID", "SEASON", "MIN_NUM"] + TEAM_BOX_STATS
+            own = team_df[cols].rename(columns={"MIN_NUM": "TEAM_MIN", **{c: f"TEAM_{c}" for c in TEAM_BOX_STATS}})
+            opp = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM"] + TEAM_BOX_STATS].rename(
+                columns={"TEAM_ID": "OPP_TEAM_ID", "MIN_NUM": "OPP_MIN", **{c: f"OPP_{c}" for c in TEAM_BOX_STATS}}
+            )
+            merged = own.merge(opp, on="GAME_ID", how="left")
+            merged = merged[merged["OPP_TEAM_ID"].isna() | (merged["OPP_TEAM_ID"] != merged["TEAM_ID"])]
+            merged = merged.drop_duplicates(subset=["GAME_ID", "TEAM_ID"]).reset_index(drop=True)
+            recon = self._reconstructed_team_lines(season_type)
+            merged = _fill_missing_team_stats(merged, recon, "TEAM", "TEAM_ID")
+            merged = _fill_missing_team_stats(merged, recon, "OPP", "OPP_TEAM_ID")
+            self._cache[cache_key] = merged
+        df = self._cache[cache_key]
+        return df[df.SEASON == season]
+
     def team_rest_days(self, season_type: str) -> pd.DataFrame:
         """
         GAME_ID, TEAM_ID, REST_DAYS for every team game of this season type:
@@ -425,13 +452,14 @@ class NBADataStore:
         shared game, so it's kept as-is from player A's row rather than
         summed (summing it would double-count team/opponent context).
 
-        Also stashes each player's own MIN_NUM/FGA/FTA/TOV (over these
-        same qualifying games) under A_*/B_* columns. USG% is nonlinear in
-        minutes (minutes is the denominator), so unlike everything else
-        here it can't be correctly recomputed from combined totals -- it
-        has to be computed per player and then added (see compare.py's
-        _compute_usage). Everything else in this frame ignores these
-        extra columns.
+        Also stashes each player's own box line (every summed column, over
+        these same qualifying games) under A_*/B_* columns. USG% and Win
+        Shares are nonlinear in the box score (USG% has minutes in the
+        denominator), so unlike everything else here they can't be correctly
+        recomputed from combined totals -- they're computed per player and
+        then added (see compare.py's _compute_usage and
+        win_shares.compute_win_shares). Everything else in this frame
+        ignores these extra columns.
         """
         a = self.games_with_team_context(player_a_id, seasons, season_type)
         b = self.games_with_team_context(player_b_id, seasons, season_type)
@@ -444,7 +472,7 @@ class NBADataStore:
         merged = a.merge(b_slim, on=["GAME_ID", "TEAM_ID"], how="inner", suffixes=("", "_b"))
         merged = merged[(merged["MIN_NUM"] >= min_minutes) & (merged["MIN_NUM_b"] >= min_minutes)]
 
-        for c in ("MIN_NUM", "FGA", "FTA", "TOV"):
+        for c in sum_cols:
             merged[f"A_{c}"] = merged[c]
             merged[f"B_{c}"] = merged[f"{c}_b"]
 
@@ -485,6 +513,18 @@ class NBADataStore:
         )
         return set(teams.index[met])
 
+    def player_game_teams(
+        self, player_ids: list[int], season_type: str, min_minutes: float = H2H_MIN_MINUTES,
+    ) -> pd.DataFrame:
+        """GAME_ID, PLAYER_ID, TEAM_ID for every game one of `player_ids`
+        logged at least min_minutes -- what the opponent-player game filter
+        (filters.py) checks a game's other team against. Same minutes rule as
+        head-to-head, so "vs. X" counts the games X really played in."""
+        df = self._load(season_type)
+        return df.loc[
+            df.PLAYER_ID.isin(player_ids) & (df.MIN_NUM >= min_minutes), ["GAME_ID", "PLAYER_ID", "TEAM_ID"]
+        ]
+
     def games_head_to_head(
         self, side: list[int], opponents: list[int], seasons: list[int], season_type: str,
         min_minutes: float = H2H_MIN_MINUTES,
@@ -515,11 +555,20 @@ class NBADataStore:
         return matches[["PLAYER_ID", "PLAYER_NAME"]].drop_duplicates().reset_index(drop=True)
 
     def all_players(self, season_type: str = "regular") -> pd.DataFrame:
-        """Full unique (PLAYER_ID, PLAYER_NAME) directory, sorted by name -- for search UIs."""
+        """
+        Full unique (PLAYER_ID, PLAYER_NAME) directory for search UIs, with
+        each player's CAREER_MIN and CAREER_GP for this season type, sorted
+        most minutes first -- so a search for a common name leads with the
+        player people mean, not whoever is first alphabetically. Games break
+        ties, which matters before 1951-52: no minutes were recorded, so
+        every early player sits at (or near) zero.
+        """
         df = self._load(season_type)
+        career = df.groupby("PLAYER_ID").agg(CAREER_MIN=("MIN_NUM", "sum"), CAREER_GP=("GAME_ID", "size"))
         return (
             df[["PLAYER_ID", "PLAYER_NAME"]]
             .drop_duplicates()
-            .sort_values("PLAYER_NAME")
+            .join(career, on="PLAYER_ID")
+            .sort_values(["CAREER_MIN", "CAREER_GP", "PLAYER_NAME"], ascending=[False, False, True])
             .reset_index(drop=True)
         )

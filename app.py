@@ -27,12 +27,13 @@ from nba_compare.formulas import safe_eval, validate_formula, flatten_block_for_
 from nba_compare.session_config import serialize_config, deserialize_config, ConfigError
 from nba_compare.presets import (
     BUILTIN_PRESETS, BUILTIN_PRESET_NAMES, DEFAULT_FORMULA_FMT,
-    apply_preset, matching_preset, preset_from_current,
+    apply_preset, matching_preset, preset_from_current, restore_user_presets,
+    load_user_presets, save_user_presets, user_presets_path, presets_to_json, presets_from_json,
 )
 from nba_compare.filters import (
     GameFilter, Condition, GAME_FIELDS, SEASON_FIELDS, OPS, OP_SYMBOLS,
     LOCATIONS, RESULTS, GAME_LENGTHS, OPPONENT_MODES, OPP_CONFERENCES,
-    PLAYOFF_ROUNDS, SERIES_HOME_COURT, SERIES_SITUATIONS,
+    PLAYOFF_ROUNDS, SERIES_HOME_COURT, SERIES_SITUATIONS, VS_PLAYER_MODES, SEASON_FINISHES,
 )
 from nba_compare.playoffs import (
     render_series_table_html, build_series_table, SERIES_COLUMN_DEFS, DEFAULT_SERIES_COLUMNS,
@@ -120,7 +121,27 @@ if "series_col_order" not in st.session_state:
 if "span_order" not in st.session_state:
     st.session_state.span_order = []
 if "user_presets" not in st.session_state:
-    st.session_state.user_presets = []  # list of {"name", "stats", "formulas"}
+    # list of {"name", "stats", "formulas"}, read from the presets file once
+    # per session -- see presets.py.
+    _loaded, _dropped, _err = load_user_presets()
+    st.session_state.user_presets = _loaded
+    st.session_state["_presets_file_ok"] = _err is None
+    if _err:
+        st.session_state["_preset_msg"] = ("error", _err)
+    elif _dropped:
+        st.session_state["_preset_msg"] = (
+            "warning", f"Dropped saved preset(s) whose stats no longer exist: {', '.join(_dropped)}.",
+        )
+
+
+def set_user_presets(presets: list[dict]) -> str | None:
+    """Replaces the session's presets and writes them to the presets file.
+    Returns the write error, if any -- the session keeps them either way. An
+    unreadable presets file found at startup is never overwritten."""
+    st.session_state.user_presets = presets
+    if not st.session_state.get("_presets_file_ok", True):
+        return f"Not saving to {user_presets_path()} -- it couldn't be read at startup; fix or remove it first."
+    return save_user_presets(presets)
 # ---------- game filter state ----------
 # Two kinds of condition row: game conditions and whole-season qualifiers
 # (see filters.py). Each kind keeps its row list under its own state key, and
@@ -250,10 +271,22 @@ def set_game_filter_state(gf: GameFilter, enabled: bool = True):
     st.session_state.gf_po_rounds = list(gf.po_rounds)
     st.session_state.gf_po_home = gf.po_home_court
     st.session_state.gf_po_situation = gf.po_situation
+    st.session_state.gf_vs_players = [f"{lg}:{pid}" for lg, pid, _ in gf.vs_players]
+    st.session_state.gf_vs_names = {f"{lg}:{pid}": name for lg, pid, name in gf.vs_players}
+    st.session_state.gf_vs_mode = gf.vs_players_mode
+    st.session_state.gf_opp_finish = gf.opp_finish
+    st.session_state.gf_team_finish = gf.team_finish
     st.session_state.gf_on = enabled
 
 
 def game_filter_from_state() -> GameFilter:
+    # Opponent players are picked as "LEAGUE:ID" keys; the names the picker
+    # last showed for them are kept in gf_vs_names (see the filter expander).
+    names = st.session_state.get("gf_vs_names", {})
+    vs_players = tuple(
+        (key.split(":")[0], int(key.split(":")[1]), names.get(key, key))
+        for key in st.session_state.get("gf_vs_players", [])
+    )
     return GameFilter(
         conditions=_conditions_from_state("game"),
         season_conditions=_conditions_from_state("season"),
@@ -266,6 +299,10 @@ def game_filter_from_state() -> GameFilter:
         po_rounds=tuple(sorted(st.session_state.get("gf_po_rounds", []))),
         po_home_court=st.session_state.get("gf_po_home", "Any"),
         po_situation=st.session_state.get("gf_po_situation", "Any"),
+        vs_players=vs_players,
+        vs_players_mode=st.session_state.get("gf_vs_mode", "Any"),
+        opp_finish=st.session_state.get("gf_opp_finish", "Any"),
+        team_finish=st.session_state.get("gf_team_finish", "Any"),
     )
 
 
@@ -509,18 +546,16 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             st.session_state.custom_formulas = valid_formulas
 
             # Saved presets get the same check on their formulas, and keep
-            # only the rows that still exist. A preset left with no rows, or
-            # one named like a built-in (which always wins), is dropped.
-            restored_presets, dropped_presets = [], []
-            for p in cfg["user_presets"]:
-                p_formulas = [f for f in p["formulas"] if not validate_formula(f["expr"], sample_vars)]
-                p_valid = set(STAT_DEFS) | {f["label"] for f in p_formulas}
-                p_stats = [x for x in p["stats"] if x in p_valid]
-                if not p_stats or p["name"] in BUILTIN_PRESET_NAMES:
-                    dropped_presets.append(p["name"])
-                    continue
-                restored_presets.append({**p, "stats": p_stats, "formulas": p_formulas})
-            st.session_state.user_presets = restored_presets
+            # only the rows that still exist (see restore_user_presets). They're
+            # merged into the presets already saved -- one in the code replaces
+            # a saved one of the same name -- rather than replacing them all,
+            # since those also live in the presets file.
+            restored_presets, dropped_presets = restore_user_presets(cfg["user_presets"])
+            preset_save_err = None
+            if restored_presets:
+                preset_save_err = set_user_presets(
+                    restore_user_presets(st.session_state.user_presets + restored_presets)[0]
+                )
 
             # Stats: only keep labels that still exist (built-ins current
             # code defines + the custom formulas just restored) -- anything
@@ -546,6 +581,8 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
                 msg += f" Dropped invalid custom formula(s): {', '.join(dropped_formulas)}."
             if dropped_presets:
                 msg += f" Dropped preset(s) (no stats left, or named like a built-in): {', '.join(dropped_presets)}."
+            if preset_save_err:
+                msg += f" {preset_save_err}"
             st.success(msg)
             st.rerun()
 
@@ -890,6 +927,44 @@ with st.expander("Game filters", expanded=False):
     )
 
     st.divider()
+    st.markdown("**Opponent players & season finish**")
+    st.caption(
+        "Like head-to-head, but for any number of rows: only games where the players picked here "
+        "were on the **other** team with 10+ minutes. *Season finish* is how far a team went in "
+        "that season's playoffs, counted back from the Finals like the rounds below (*Last 4* = "
+        "the conference finals in a 4-round NBA year) and cumulative (*Made last 4* includes the "
+        "Finalists) -- so \"opponent won title\" also keeps regular-season games against the "
+        "eventual champion."
+    )
+    # Picker keys are "LEAGUE:ID", since the two leagues' ids are separate
+    # lists. A player picked under another league setting stays selected,
+    # named from gf_vs_names.
+    vs_names = dict(zip(directory.LEAGUE + ":" + directory.PLAYER_ID.astype(str), directory.PLAYER_NAME))
+    vs_names |= {k: v for k, v in st.session_state.get("gf_vs_names", {}).items() if k not in vs_names}
+    vs_options = list(vs_names)
+    vs_cols = st.columns([1, 4])
+    vs_cols[0].radio(
+        "Match", VS_PLAYER_MODES, key="gf_vs_mode",
+        format_func={"Any": "vs. any of", "All": "vs. all of", "None": "vs. none of"}.get,
+        help="*All of* keeps games where every player picked was on the other team at once.",
+    )
+    vs_cols[1].multiselect(
+        "Opponent players", vs_options, key="gf_vs_players", placeholder="Type a name…",
+        format_func=lambda k: f"{vs_names[k]} ({k.split(':')[0]})" if league_mode == "Both" else vs_names[k],
+    )
+    st.session_state.gf_vs_names = {k: vs_names[k] for k in st.session_state.get("gf_vs_players", [])}
+    fin_cols = st.columns(2)
+    fin_cols[0].selectbox(
+        "Opponent's season", list(SEASON_FINISHES), key="gf_opp_finish", format_func=SEASON_FINISHES.get,
+        help="Only games against teams that went this far that season.",
+    )
+    fin_cols[1].selectbox(
+        "Own team's season", list(SEASON_FINISHES), key="gf_team_finish", format_func=SEASON_FINISHES.get,
+        help="Only games for a team (this row's team) that went this far that season -- e.g. a "
+             "player's title runs.",
+    )
+
+    st.divider()
     st.markdown("**Playoff games**")
     st.caption(
         "These only narrow **playoff** games -- the regular-season table is untouched. Rounds count "
@@ -965,13 +1040,33 @@ def _save_user_preset():
         preset = preset_from_current(name, st.session_state.stat_order, st.session_state.custom_formulas)
         others = [p for p in st.session_state.user_presets if p["name"] != name]
         replaced = len(others) != len(st.session_state.user_presets)
-        st.session_state.user_presets = others + [preset]
+        err = set_user_presets(others + [preset])
         st.session_state.new_preset_name = ""
-        st.session_state["_preset_msg"] = ("success", f"{'Updated' if replaced else 'Saved'} preset '{name}'.")
+        st.session_state["_preset_msg"] = ("error", err) if err else (
+            "success", f"{'Updated' if replaced else 'Saved'} preset '{name}'.",
+        )
 
 
 def _delete_user_preset(name: str):
-    st.session_state.user_presets = [p for p in st.session_state.user_presets if p["name"] != name]
+    err = set_user_presets([p for p in st.session_state.user_presets if p["name"] != name])
+    if err:
+        st.session_state["_preset_msg"] = ("error", err)
+
+
+def _import_presets_file():
+    upload = st.session_state.get("preset_import")
+    if upload is None:
+        return
+    try:
+        imported, dropped = presets_from_json(upload.getvalue())
+    except ValueError as e:
+        st.session_state["_preset_msg"] = ("error", str(e))
+        return
+    err = set_user_presets(restore_user_presets(st.session_state.user_presets + imported)[0])
+    msg = f"Imported {len(imported)} preset(s)" + (f": {', '.join(p['name'] for p in imported)}." if imported else ".")
+    if dropped:
+        msg += f" Dropped (no stats left, or named like a built-in): {', '.join(dropped)}."
+    st.session_state["_preset_msg"] = ("error", err) if err else ("success", msg)
 
 
 if len(valid_spans) == 0:
@@ -1030,17 +1125,29 @@ else:
         preset_cols[0].text_input(
             "Save these stats as a preset", key="new_preset_name", placeholder="Preset name",
             help="Saves the stats above, in this order, plus any custom formulas they use. "
-                 "Saving under an existing name updates it. Presets are kept in your save code.",
+                 f"Saving under an existing name updates it. Presets are saved to "
+                 f"{user_presets_path()} and come back after a refresh; they're also kept in your save code.",
         )
         preset_cols[1].button("Save preset", on_click=_save_user_preset, use_container_width=True)
         msg = st.session_state.pop("_preset_msg", None)
         if msg:
-            (st.error if msg[0] == "error" else st.success)(msg[1])
+            {"error": st.error, "warning": st.warning}.get(msg[0], st.success)(msg[1])
         for p in st.session_state.user_presets:
             cols = st.columns([4, 1])
             cols[0].caption(f"**{p['name']}** — {len(p['stats'])} stats")
             cols[1].button("✕", key=f"del_user_preset_{p['name']}",
                            on_click=_delete_user_preset, args=(p["name"],))
+        io_cols = st.columns(2)
+        io_cols[0].download_button(
+            "Export presets", data=presets_to_json(st.session_state.user_presets),
+            file_name="nba_compare_presets.json", mime="application/json",
+            disabled=not st.session_state.user_presets, use_container_width=True,
+            help="Download your presets as a file, to back them up or move them to another machine.",
+        )
+        io_cols[1].file_uploader(
+            "Import presets", type=["json"], key="preset_import", on_change=_import_presets_file,
+            help="Add presets from an exported file. One with the same name as a saved preset replaces it.",
+        )
 
     result = compare_spans(valid_spans, stores, game_filter)
     if game_filter.is_active:
@@ -1116,6 +1223,17 @@ else:
                 "the games in this span. Each is averaged over the games that have it recorded; "
                 "before 1985 (NBA) most columns are rebuilt from player logs where possible, as are "
                 "WNBA team turnovers in 1997, 2000 and 2003 (footnoted)."
+            )
+        if any(lbl in ("OWS", "DWS", "WS", "WS/48") for lbl in stat_labels):
+            st.caption(
+                "**Win Shares** = Basketball-Reference's method: credit for team wins split into "
+                "offense (OWS, from Dean Oliver's points produced) and defense (DWS, from his "
+                "individual defensive rating), against that season's league averages. A plain "
+                "season or career uses the team's full-season totals, as Basketball-Reference does; "
+                "a filtered span, head-to-head or duo uses only its own games, so it's the wins "
+                "earned in those games. A duo's is the two players' own Win Shares added. WS/48 is "
+                "per 48 minutes in the WNBA too (Basketball-Reference shows WS/40 there). Blank for "
+                "NBA seasons before 1977-78, which have no player turnovers."
             )
         if len({s.league for s in valid_spans}) > 1:
             st.caption(

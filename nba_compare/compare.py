@@ -11,6 +11,7 @@ from .models import PlayerSpan, DuoSpan
 from . import playoffs as _playoffs
 from . import percentiles as _percentiles
 from . import filters as _filters
+from .win_shares import compute_win_shares
 
 # Stats we compute per-game standard deviation / coefficient-of-variation for,
 # as a rough "consistency" read: how much a player's game-to-game output swings.
@@ -538,6 +539,9 @@ def aggregate_span(
             result["regular"]["relative_shooting"] = _relative_shooting(
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
+            result["regular"]["win_shares"] = compute_win_shares(
+                reg_games, store, "regular", full_team_seasons=not narrowed("regular")
+            )
     if span.include_playoffs:
         po_games, po_total = _filtered_games(span, store, "playoffs", game_filter, keep_ids, seasons)
         result["filter_counts"]["playoffs"] = (len(po_games), po_total)
@@ -545,6 +549,9 @@ def aggregate_span(
         if result["playoffs"] is not None:
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
+            )
+            result["playoffs"]["win_shares"] = compute_win_shares(
+                po_games, store, "playoffs", full_team_seasons=not narrowed("playoffs")
             )
             if narrowed("playoffs"):
                 records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
@@ -591,6 +598,8 @@ def aggregate_duo_span(
             result["regular"]["relative_shooting"] = _relative_shooting(
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
+            # A duo's team context is the games they shared, never the full season.
+            result["regular"]["win_shares"] = compute_win_shares(reg_games, store, "regular")
     if duo.include_playoffs:
         po_games, po_total = _filtered_games(duo, store, "playoffs", game_filter, keep_ids, seasons)
         result["filter_counts"]["playoffs"] = (len(po_games), po_total)
@@ -599,6 +608,7 @@ def aggregate_duo_span(
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
+            result["playoffs"]["win_shares"] = compute_win_shares(po_games, store, "playoffs")
             records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
             if narrowed("playoffs"):
                 records = [r for r in records if r["player_played"]]

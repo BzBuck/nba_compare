@@ -156,24 +156,7 @@ def deserialize_config(code: str) -> dict:
 
     formulas = _read_formulas(payload.get("custom_formulas", []))
 
-    presets_raw = payload.get("user_presets", [])
-    user_presets = []
-    if isinstance(presets_raw, list):
-        for p in presets_raw:
-            if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"].strip():
-                continue
-            stats = p.get("stats", [])
-            stats = [x for x in stats if isinstance(x, str)] if isinstance(stats, list) else []
-            if not stats:
-                continue
-            user_presets.append({
-                "name": p["name"],
-                "stats": stats,
-                "formulas": [
-                    {k: v for k, v in f.items() if k != "managed"}
-                    for f in _read_formulas(p.get("formulas", []))
-                ],
-            })
+    user_presets = read_user_presets(payload.get("user_presets", []))
 
     return {
         "spans": spans,
@@ -186,6 +169,31 @@ def deserialize_config(code: str) -> dict:
         "game_filter": payload.get("game_filter") if isinstance(payload.get("game_filter"), dict) else {},
         "config_version_found": payload.get("config_version"),
     }
+
+
+def read_user_presets(raw) -> list[dict]:
+    """Saved stat presets, type-checked the same lenient way as the rest of
+    a save: {"name", "stats", "formulas"} each, malformed entries skipped.
+    Also how presets.py reads the presets file, which holds the same shape."""
+    user_presets = []
+    if not isinstance(raw, list):
+        return user_presets
+    for p in raw:
+        if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"].strip():
+            continue
+        stats = p.get("stats", [])
+        stats = [x for x in stats if isinstance(x, str)] if isinstance(stats, list) else []
+        if not stats:
+            continue
+        user_presets.append({
+            "name": p["name"],
+            "stats": stats,
+            "formulas": [
+                {k: v for k, v in f.items() if k != "managed"}
+                for f in _read_formulas(p.get("formulas", []))
+            ],
+        })
+    return user_presets
 
 
 def _read_formulas(raw) -> list[dict]:

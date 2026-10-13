@@ -67,6 +67,11 @@ STAT_DEFS = {
     "MIN%":       (lambda b: (b["usage"] or {}).get("min_pct"),         "{:.1f}", False),
     "USG%":       (lambda b: (b["usage"] or {}).get("usg_pct"),         "{:.1f}", False),
     "USG Vol/G":  (lambda b: (b["usage"] or {}).get("usage_per_game"),  "{:.1f}", False),
+    # Win Shares (see win_shares.py). Total WS is a preset formula, OWS + DWS;
+    # WS/48 can't be one, since it's over only the minutes WS covers.
+    "OWS":        (lambda b: (b.get("win_shares") or {}).get("ows"),       "{:.1f}", False),
+    "DWS":        (lambda b: (b.get("win_shares") or {}).get("dws"),       "{:.1f}", False),
+    "WS/48":      (lambda b: (b.get("win_shares") or {}).get("ws_per_48"), "{:.3f}", False),
     "Team Poss/G": (lambda b: (b["team"] or {}).get("team_poss_per_game"), "{:.1f}", False),
     "Team Pace":  (lambda b: (b["team"] or {}).get("team_pace"),        "{:.1f}", False),
     "Team ORtg":  (lambda b: (b["team"] or {}).get("team_ortg"),        "{:.1f}", False),
@@ -189,50 +194,75 @@ ESTIMATED_SOURCES = {
     "Team ORtg": "team",
     "Team DRtg": "team",
     "Net Rtg": "team",
+    "OWS": "win_shares",
+    "DWS": "win_shares",
+    "WS/48": "win_shares",
 }
 
 
 # PARTIAL: a value averaged over only SOME of the span's games, because the
 # stat wasn't recorded for the rest. Its footnote lists each marked span's
-# game count.
+# game count. PARTIAL_WS is the same for Win Shares, whose missing games
+# are missing for a different reason.
 PARTIAL = "partial"
 PARTIAL_NOTE = (
     "Plus-minus wasn't recorded before 1996-97 in the NBA (2008 in the WNBA), so for a "
     "span reaching earlier it's averaged over only the games that have it:"
 )
-FOOTNOTES = {ESTIMATED: ESTIMATED_NOTE, PARTIAL: PARTIAL_NOTE}
+PARTIAL_WS = "partial_ws"
+PARTIAL_WS_NOTE = (
+    "Win Shares need player turnovers, which the NBA only recorded from 1977-78, so for a "
+    "span reaching earlier they count only the games from then on:"
+)
+FOOTNOTES = {ESTIMATED: ESTIMATED_NOTE, PARTIAL: PARTIAL_NOTE, PARTIAL_WS: PARTIAL_WS_NOTE}
 
 # Small and faint, so a footnote number beside a stat reads as a marker and
 # not an exponent (the browser default is ~83% size, full strength); line-
 # height 0 keeps a marked cell from growing taller than its row.
 FOOTNOTE_MARK_STYLE = "font-size:.6em;opacity:.55;margin-left:2px;line-height:0;"
 
-# Rows that can carry the PARTIAL footnote -> the stat-block key holding (games
-# with the stat, games in the span).
+def _ws_coverage(block: dict) -> tuple[int, int] | None:
+    ws = block.get("win_shares")
+    return (ws["covered_games"], ws["games"]) if ws else None
+
+
+# Rows that can carry a partial-coverage footnote -> (its footnote kind, a
+# getter for (games with the stat, games in the span)).
 PARTIAL_SOURCES = {
-    "+/-": "plus_minus_coverage",
-    "+/- Std Dev": "plus_minus_coverage",
+    "+/-": (PARTIAL, lambda b: b.get("plus_minus_coverage")),
+    "+/- Std Dev": (PARTIAL, lambda b: b.get("plus_minus_coverage")),
+    "OWS": (PARTIAL_WS, _ws_coverage),
+    "DWS": (PARTIAL_WS, _ws_coverage),
+    "WS/48": (PARTIAL_WS, _ws_coverage),
 }
 
 
-def _partial_coverage(block: dict | None, label: str) -> tuple[int, int] | None:
-    """(games with the stat, games) when this row's value covers only some
-    of the span's games, else None. A span with NONE of them recorded isn't
-    partial -- its value is simply missing and shows \u2014."""
-    key = PARTIAL_SOURCES.get(label)
-    if block is None or key is None or not block.get(key):
+def _partial_coverage(block: dict | None, label: str) -> tuple[str, int, int] | None:
+    """(footnote kind, games with the stat, games) when this row's value
+    covers only some of the span's games, else None. A span with NONE of
+    them recorded isn't partial -- its value is simply missing and shows \u2014."""
+    source = PARTIAL_SOURCES.get(label)
+    if block is None or source is None:
         return None
-    recorded, games = block[key]
-    return (recorded, games) if 0 < recorded < games else None
+    kind, getter = source
+    coverage = getter(block)
+    if not coverage:
+        return None
+    recorded, games = coverage
+    return (kind, recorded, games) if 0 < recorded < games else None
 
 
 def _cell_mark(block: dict | None, label: str) -> tuple[str, str | None] | None:
-    """(footnote kind, detail for this span) for its value in this row, or None."""
-    if _is_estimated(block, label):
-        return (ESTIMATED, None)
+    """(footnote kind, detail for this span) for its value in this row, or
+    None. A cell takes one mark, and missing games outrank estimated ones:
+    a career Win Shares total that skips its first eight seasons is the
+    bigger thing to know."""
     partial = _partial_coverage(block, label)
     if partial:
-        return (PARTIAL, f"{partial[0]:,} of {partial[1]:,} games")
+        kind, recorded, games = partial
+        return (kind, f"{recorded:,} of {games:,} games")
+    if _is_estimated(block, label):
+        return (ESTIMATED, None)
     return None
 
 

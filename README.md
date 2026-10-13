@@ -110,7 +110,8 @@ streamlit run app.py
   See "Head-to-head" below.
 - **Game filters**: optionally count only the games that pass conditions
   you set — close games, games against top-8 seeds or winning teams,
-  nights with 30+ minutes, road wins, overtime games, specific opponents —
+  nights with 30+ minutes, road wins, overtime games, specific opponents,
+  games against a chosen player, games against the eventual champion —
   combined freely, for every row at once. See "Game filters" below.
 - **Season range slider** per span (single season, a few years, or full
   career), plus independent toggles for regular season / playoffs.
@@ -657,6 +658,21 @@ A game counts only if it passes **every** part of the filter:
 - **Opponents** — only vs., or excluding, a list of teams. Abbreviations are
   as they were at the time, so a relocated franchise appears under each name
   (SEA and OKC); pick all you mean.
+- **Opponent players** — head-to-head as a filter: only games where the
+  picked players were on the *other* team with 10+ minutes (the same rule
+  head-to-head uses), for any number of rows and without touching their
+  seasons. *vs. any of* keeps a game if one of them played, *vs. all of*
+  only if every one did, *vs. none of* drops every game any of them played.
+  A player from the other league never matches, so in **Both** mode a WNBA
+  row keeps no games under "vs. LeBron".
+- **Opponent's season / Own team's season** — how far that team went in
+  that season's playoffs: won title, made Finals, made last 4, made last 8,
+  made playoffs, missed playoffs. Cumulative (*made last 4* includes the
+  Finalists) and counted back from the Finals like *Round* below, so it
+  means the conference finals in a 4-round NBA year. It reads the whole
+  postseason, so regular-season games against the eventual champion count.
+  A season the data has no playoffs for (one in progress) fails every
+  choice rather than counting as "missed".
 
 - **Playoff games**: these narrow *only* playoff games. The regular-season
   table, and its %ile rows, are untouched.
@@ -720,7 +736,7 @@ one click:
 | Per 36 | every counting stat per 36 minutes |
 | Era-adjusted | Poss/G, Team Pace, /75 rates, relative shooting, USG%, %iles |
 | Efficiency | shooting splits, 2P%, e3P%, 3PAr, FTr, points-share by shot type, AST/TOV, TOV% |
-| Advanced | Basketball-Reference style PTS%/ORB%/DRB%/TRB%/AST%/STL%/BLK%/TOV%, USG%, MIN%, GmSc, PANTS |
+| Advanced | Basketball-Reference style PTS%/ORB%/DRB%/TRB%/AST%/STL%/BLK%/TOV%, USG%, MIN%, GmSc, PANTS, OWS/DWS/WS/WS/48 |
 | Team impact | Team W%, MOV, ORtg/DRtg/Net, Pace, Team/Opp PTS/G, +/-, MIN%, Avg Seed |
 | Playoff résumé | championships, Finals apps, series W/L, best round, missed series |
 | Consistency | every Floor (P10) and CV% row, plus +/- Std Dev |
@@ -744,12 +760,27 @@ A few of the formulas worth knowing:
 - **e3P%** = 3P% × 1.5 (a made three on the same footing as eFG%).
 - **PANTS** = PTS/G − TSA/G, points beyond one per true shot attempt.
 - **GmSc** = Hollinger's Game Score from per-game averages.
+- **WS** = OWS + DWS (both built-in -- see Win Shares below).
 
 **Your own presets**: under "Customize stats shown", name the current rows
 and **Save preset** — it keeps the rows in order plus the formulas behind
 any of them, so it rebuilds them even in a session that doesn't have them.
-Saving under an existing name updates it, a built-in name is refused, and
-saved presets travel in your save code.
+Saving under an existing name updates it, and a built-in name is refused.
+
+Your presets are written to `~/.nba_compare/presets.json` every time you save
+or delete one, and read back when the app starts, so they survive a refresh
+or restart. Set `NBA_COMPARE_PRESETS_FILE` to keep them somewhere else. The
+file goes through the same checks as a save code (see "Save / Load setup"),
+so a preset whose stats no longer exist is dropped and reported rather than
+breaking the load. If the file can't be read, the app tells you and leaves
+it untouched instead of overwriting it.
+
+**Export presets** downloads them as a JSON file and **Import presets** adds
+the presets from one, replacing any saved preset with the same name. Presets
+also travel in your save code; loading a code adds its presets to the ones
+you already have instead of replacing them. On a shared deployment everyone
+uses the same presets file, so there export/import is the way to keep your
+own.
 
 ## Custom formulas
 
@@ -852,6 +883,11 @@ close_vs_good = GameFilter(
     conditions=(Condition("|Margin|", "<=", 10), Condition("Opp Seed", "<=", 8)),
     location="Away",            # or "Home"; result="W"/"L"; game_length="Overtime"/"Regulation"
 )
+vs_champs = GameFilter(
+    vs_players=(("NBA", 2544, "LeBron James"),),  # (league, player id, name)
+    vs_players_mode="Any",      # or "All" / "None"
+    opp_finish="Champion",      # filters.SEASON_FINISHES; team_finish= for the row's own team
+)
 result = compare_spans(spans, store, close_vs_good)
 result.aggregates[0]["filter_counts"]   # {"regular": (games kept, games before), "playoffs": ...}
 ```
@@ -877,5 +913,20 @@ notebook/script use — `smoke_test.py` exercises this exact path.
   multi-game spans: sum the raw components across the whole span, then
   apply the formula once — not an average of per-game percentages, which
   would overweight low-minute games.
-- Advanced metrics needing full season/league context (Win Shares, BPM,
-  VORP) aren't computable from raw box scores alone and aren't included.
+- **Win Shares** (OWS, DWS, WS/48 built in; WS = OWS + DWS in the Advanced
+  preset) follow Basketball-Reference's method -- Dean Oliver's points
+  produced and individual defensive rating against that season's league
+  points per possession, points per game and pace -- computed per
+  (season, team) and summed, so a traded player's season splits the way
+  theirs does (`win_shares.py`). A plain season or career uses each team's
+  full-season totals and reproduces Basketball-Reference to about 0.1 WS
+  (LeBron 2008-09: 20.3 vs 20.2; Jokić 2021-22: 15.2 vs 15.2); a filtered
+  span, head-to-head or duo uses only its own games. A duo's is the two
+  players' own Win Shares added, not one run on the combined box line.
+  NBA seasons before 1977-78 have no player turnovers and get none
+  (Basketball-Reference estimates them from player age, which the data
+  doesn't have); a span reaching earlier is footnoted with the games it
+  covers. 1977-84 rest on rebuilt team lines and are marked estimated.
+  WS/48 is per 48 minutes in the WNBA too.
+- BPM and VORP aren't included: BPM's team adjustment needs every
+  teammate's season and a strength-of-schedule team rating.

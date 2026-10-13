@@ -28,6 +28,20 @@ reads the same hardcoded conference table, so it reflects today's
 alignment -- realignments (Milwaukee moving East in 1980, ...) aren't
 modeled, and teams the table doesn't cover fail an East/West choice.
 
+Two parts come from head-to-head's side of things, but work for any
+number of rows:
+- Opponent players: only games where a chosen player (any / all of
+  several) was on the OTHER team with 10+ minutes -- data.H2H_MIN_MINUTES,
+  the same rule head-to-head uses -- or games where none of them were.
+  Unlike head-to-head, the row's own seasons and games are untouched
+  otherwise, so "LeBron and Durant, only vs. Curry" just works.
+- Season finish: how far the opponent's (or the row's own) team went in
+  that season's playoffs -- won the title, reached the Finals / last 4 /
+  last 8, made or missed the playoffs (playoffs.season_playoff_finish). It
+  reads the whole postseason, so a regular-season game "vs. the eventual
+  champion" counts. A season the data has no postseason for fails every
+  choice rather than passing as "missed".
+
 Playoff-only parts (rounds, series home court, closeout/elimination, and
 the "playoff" fields) narrow playoff games and leave the regular season
 alone -- see playoffs.playoff_game_context for how a game's place in its
@@ -75,6 +89,19 @@ PLAYOFF_ROUNDS = {0: "Finals", 1: "Last 4", 2: "Last 8", 3: "Last 16"}
 SERIES_HOME_COURT = ("Any", "With", "Without")
 SERIES_SITUATIONS = ("Any", "Closeout", "Elimination", "Either", "Winner-take-all")
 OPPONENT_MODES = ("Only", "Exclude")
+VS_PLAYER_MODES = ("Any", "All", "None")   # opponent players: vs. any of / all of / none of them
+
+# Season finish, cumulative: "Last 4" includes the Finalists and champion.
+# Rounds use the same count-back-from-the-Finals as PLAYOFF_ROUNDS.
+SEASON_FINISHES = {
+    "Any": "Any",
+    "Champion": "Won title",
+    "Finals": "Made Finals",
+    "Last 4": "Made last 4",
+    "Last 8": "Made last 8",
+    "Playoffs": "Made playoffs",
+    "Missed": "Missed playoffs",
+}
 
 # A game's team minutes above regulation (5 x game length) by more than
 # this count as overtime -- one OT period adds 25 player-minutes.
@@ -131,6 +158,52 @@ class _Ctx:
         ).drop_duplicates(["GAME_ID", "TEAM_ID"]).set_index(["GAME_ID", "TEAM_ID"])
         keys = pd.MultiIndex.from_arrays([self.g["GAME_ID"], self.g["TEAM_ID"]])
         return table.reindex(keys).set_axis(self.g.index)
+
+    @cached_property
+    def _finishes(self) -> pd.DataFrame:
+        """MADE / ROUNDS_FROM_FINALS / CHAMPION for every team of every
+        season in self.g that has a postseason in the data -- a team with a
+        regular season but no playoff games MADE=False. Seasons with no
+        postseason are left out, so their games look up NaN and fail."""
+        parts = []
+        for s in self.g["SEASON"].unique():
+            finish = _playoffs.season_playoff_finish(self.store, int(s))
+            if finish.empty:
+                continue
+            teams = _playoffs.season_standings(self.store, int(s))[["TEAM_ABBREVIATION"]]
+            teams = pd.concat([teams, finish[["TEAM_ABBREVIATION"]]]).drop_duplicates()
+            part = teams.merge(finish, on="TEAM_ABBREVIATION", how="left")
+            part["MADE"] = part["ROUNDS_FROM_FINALS"].notna()
+            parts.append(part.assign(SEASON=s))
+        if not parts:
+            return pd.DataFrame(columns=["MADE", "ROUNDS_FROM_FINALS", "CHAMPION"],
+                                index=pd.MultiIndex.from_arrays([[], []], names=["SEASON", "TEAM_ABBREVIATION"]))
+        return pd.concat(parts, ignore_index=True).set_index(["SEASON", "TEAM_ABBREVIATION"])
+
+    def finish_mask(self, abbrs: pd.Series, finish: str) -> pd.Series:
+        """Whether each game's team in `abbrs` reached `finish` (a
+        SEASON_FINISHES key) that season. Comparisons are NaN-safe: an
+        unknown finish fails every choice."""
+        keys = pd.MultiIndex.from_arrays([self.g["SEASON"], abbrs])
+        f = self._finishes.reindex(keys).set_axis(self.g.index)
+        rff = pd.to_numeric(f["ROUNDS_FROM_FINALS"], errors="coerce")
+        if finish == "Champion":
+            return f["CHAMPION"] == True  # noqa: E712 -- NaN-safe
+        if finish == "Playoffs":
+            return f["MADE"] == True  # noqa: E712
+        if finish == "Missed":
+            return f["MADE"] == False  # noqa: E712
+        return rff <= {"Finals": 0, "Last 4": 1, "Last 8": 2}[finish]
+
+    def vs_player_count(self, player_ids: list[int]) -> pd.Series:
+        """How many of `player_ids` played (10+ min) for the other team in
+        each game."""
+        played = self.store.player_game_teams(player_ids, self.season_type)
+        played = played[played["GAME_ID"].isin(self.g["GAME_ID"])]
+        keys = self.g[["GAME_ID", "TEAM_ID"]].rename_axis("_row").reset_index()
+        met = keys.merge(played, on="GAME_ID", suffixes=("", "_P"))
+        met = met[met["TEAM_ID"] != met["TEAM_ID_P"]]
+        return met.groupby("_row")["PLAYER_ID"].nunique().reindex(self.g.index, fill_value=0)
 
     def conference_of(self, abbrs: pd.Series) -> pd.Series:
         table = _playoffs.CONFERENCES[self.store.league]
@@ -236,6 +309,10 @@ class GameFilter:
     po_rounds: tuple[int, ...] = ()     # PLAYOFF_ROUNDS keys; empty = every round
     po_home_court: str = "Any"          # SERIES_HOME_COURT
     po_situation: str = "Any"           # SERIES_SITUATIONS
+    vs_players: tuple[tuple[str, int, str], ...] = ()  # (league, player id, name) -- opponent players
+    vs_players_mode: str = "Any"        # VS_PLAYER_MODES
+    opp_finish: str = "Any"             # SEASON_FINISHES key, the opponent's season
+    team_finish: str = "Any"            # SEASON_FINISHES key, this row's own team's season
 
     def narrows(self, season_type: str) -> bool:
         """Whether any GAME-level part applies to this season type -- what
@@ -247,6 +324,7 @@ class GameFilter:
             self.opponents
             or self.location != "Any" or self.result != "Any" or self.game_length != "Any"
             or self.opp_conference != "Any"
+            or self.vs_players or self.opp_finish != "Any" or self.team_finish != "Any"
             or any(GAME_FIELDS[c.field].kind != "playoff" for c in self.conditions if c.field in GAME_FIELDS)
         )
         if season_type == "regular":
@@ -280,6 +358,18 @@ class GameFilter:
             out.append(f"vs. {self.opp_conference.lower()} conference")
         if self.opponents:
             out.append(f"{'Only vs.' if self.opponents_mode == 'Only' else 'Excluding'} {', '.join(self.opponents)}")
+        if self.vs_players:
+            names = [name for _, _, name in self.vs_players]
+            if self.vs_players_mode == "None":
+                out.append(f"Not vs. {' or '.join(names)}")
+            elif self.vs_players_mode == "All" and len(names) > 1:
+                out.append(f"vs. {' and '.join(names)} together")
+            else:
+                out.append(f"vs. {' or '.join(names)}")
+        if self.opp_finish != "Any":
+            out.append(f"Opponent {SEASON_FINISHES[self.opp_finish].lower()}")
+        if self.team_finish != "Any":
+            out.append(f"Own team {SEASON_FINISHES[self.team_finish].lower()}")
         if self.po_rounds:
             out.append("Playoffs: " + ", ".join(PLAYOFF_ROUNDS[r] for r in sorted(self.po_rounds)))
         if self.po_home_court != "Any":
@@ -301,6 +391,10 @@ class GameFilter:
             "po_rounds": list(self.po_rounds),
             "po_home_court": self.po_home_court,
             "po_situation": self.po_situation,
+            "vs_players": [{"league": lg, "id": pid, "name": name} for lg, pid, name in self.vs_players],
+            "vs_players_mode": self.vs_players_mode,
+            "opp_finish": self.opp_finish,
+            "team_finish": self.team_finish,
         }
 
     @classmethod
@@ -330,6 +424,12 @@ class GameFilter:
         opponents = raw.get("opponents") or []
         rounds = raw.get("po_rounds") if isinstance(raw.get("po_rounds"), list) else []
         rounds = [r for r in rounds if isinstance(r, int) and not isinstance(r, bool)]
+        vs_players = []
+        for p in raw.get("vs_players") if isinstance(raw.get("vs_players"), list) else []:
+            if (isinstance(p, dict) and isinstance(p.get("league"), str) and isinstance(p.get("name"), str)
+                    and isinstance(p.get("id"), int) and not isinstance(p.get("id"), bool)):
+                vs_players.append((p["league"], p["id"], p["name"]))
+        finishes = tuple(SEASON_FINISHES)
         return cls(
             conditions=conditions,
             season_conditions=season_conditions,
@@ -342,6 +442,10 @@ class GameFilter:
             po_rounds=tuple(sorted({r for r in rounds if r in PLAYOFF_ROUNDS})),
             po_home_court=pick("po_home_court", SERIES_HOME_COURT),
             po_situation=pick("po_situation", SERIES_SITUATIONS),
+            vs_players=tuple(dict.fromkeys(vs_players)),
+            vs_players_mode=pick("vs_players_mode", VS_PLAYER_MODES),
+            opp_finish=pick("opp_finish", finishes),
+            team_finish=pick("team_finish", finishes),
         )
 
 
@@ -405,6 +509,20 @@ def filter_mask(
     if game_filter.opponents:
         listed = ctx.opponent.isin(game_filter.opponents)
         mask &= listed if game_filter.opponents_mode == "Only" else ~listed
+    if game_filter.vs_players:
+        # A player from another league never played this row's games: an
+        # "any"/"all" filter keeps none of them, a "none" filter all of them.
+        ids = [pid for lg, pid, _ in game_filter.vs_players if lg == store.league]
+        met = ctx.vs_player_count(ids) if ids else pd.Series(0, index=games.index)
+        mask &= {
+            "Any": met > 0,
+            "All": (met == len(game_filter.vs_players)) & (met > 0),
+            "None": met == 0,
+        }[game_filter.vs_players_mode]
+    if game_filter.opp_finish != "Any":
+        mask &= ctx.finish_mask(ctx.opponent, game_filter.opp_finish)
+    if game_filter.team_finish != "Any":
+        mask &= ctx.finish_mask(games["TEAM_ABBREVIATION"], game_filter.team_finish)
 
     if season_type == "playoffs":
         po = ctx.po_context if (
