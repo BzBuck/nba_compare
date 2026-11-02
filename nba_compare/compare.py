@@ -13,14 +13,14 @@ from . import playoffs as _playoffs
 from . import percentiles as _percentiles
 from . import filters as _filters
 from .win_shares import compute_win_shares
+from . import box as _box
+from .box import FIRST_THREE_POINT_SEASON
 
 # Stats we compute per-game standard deviation / coefficient-of-variation for,
 # as a rough "consistency" read: how much a player's game-to-game output swings.
 # Kept in sync with table.STAT_DEFS's *_CV%/*_Floor rows -- add a stat in both places.
 CONSISTENCY_STATS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "FGM", "FTM"]
 
-# 1979-80, the first season with a 3-point line (SEASON is the start year).
-FIRST_THREE_POINT_SEASON = 1979
 
 
 def _any_estimated(rows: pd.DataFrame) -> bool:
@@ -72,7 +72,7 @@ def _compute_per_100(games_with_team: pd.DataFrame) -> dict | None:
     columns -- every season before 1977, where turnovers simply weren't
     recorded and there is no possession estimate to be made from any source.
     """
-    valid = games_with_team.dropna(subset=["TEAM_MIN", "TEAM_FGA", "TEAM_FTA", "TEAM_TOV", "TEAM_OREB"])
+    valid = games_with_team.dropna(subset=["MIN_NUM", "TEAM_MIN", "TEAM_FGA", "TEAM_FTA", "TEAM_TOV", "TEAM_OREB"])
     if valid.empty:
         return None
 
@@ -87,9 +87,15 @@ def _compute_per_100(games_with_team: pd.DataFrame) -> dict | None:
     if not player_poss:
         return None
 
+    # A stat the logs left blank for some of these games is its per-game
+    # average (over the games that have it) per possession per game.
     n = len(valid)
+    b = _box.box_sums(valid)
     return {
-        "per_100": {c: 100 * valid[c].sum() / player_poss for c in COUNTING_STATS},
+        "per_100": {
+            c: 100 * (b["sums"][c] / b["counts"][c]) / (player_poss / n) if b["counts"][c] else None
+            for c in COUNTING_STATS
+        },
         "player_poss": player_poss,
         "player_poss_per_game": player_poss / n,
         "games_with_poss_data": n,
@@ -111,7 +117,10 @@ def _compute_usage(games_with_team: pd.DataFrame) -> dict | None:
     Returns None if no games have matching team data (e.g. team parquet
     missing that GAME_ID/TEAM_ID combo).
     """
-    valid = games_with_team.dropna(subset=["TEAM_MIN", "TEAM_FGA", "TEAM_FTA", "TEAM_TOV"])
+    # Only games with the player's own minutes and usage events recorded too
+    # -- a blank there is unrecorded, and summing around it would set one
+    # game's plays against another game's minutes.
+    valid = games_with_team.dropna(subset=["MIN_NUM", "FGA", "FTA", "TOV", "TEAM_MIN", "TEAM_FGA", "TEAM_FTA", "TEAM_TOV"])
     if valid.empty:
         return None
 
@@ -271,43 +280,23 @@ def _compute_team_box(games_with_team: pd.DataFrame) -> dict | None:
             games_with_team = games_with_team.copy()
             for col in ("TEAM_FG3M", "TEAM_FG3A", "OPP_FG3M", "OPP_FG3A"):
                 games_with_team.loc[pre_three, col] = games_with_team.loc[pre_three, col].fillna(0)
+    cols = ["TEAM_MIN"] + [f"{p}_{c}" for p in ("TEAM", "OPP") for c in TEAM_BOX_STATS]
+    vals = games_with_team[cols].astype(float)
+    # Much of the 1960s logs record team minutes as 0 -- missing, not a
+    # real value, and averaging it in would sink the mean.
+    vals["TEAM_MIN"] = vals["TEAM_MIN"].where(vals["TEAM_MIN"] > 0)
+    present = vals.notna()
+    means = vals.mean()
     result, estimated = {}, {}
-    for col in ["TEAM_MIN"] + [f"{p}_{c}" for p in ("TEAM", "OPP") for c in TEAM_BOX_STATS]:
-        vals = games_with_team[col].dropna()
-        if col == "TEAM_MIN":
-            # Much of the 1960s logs record team minutes as 0 -- missing,
-            # not a real value, and averaging it in would sink the mean.
-            vals = vals[vals > 0]
-        result[col] = vals.mean() if not vals.empty else None
+    for col in cols:
+        result[col] = means[col] if present[col].any() else None
         est_col = f"{col}_EST"
         estimated[col] = (
-            bool(games_with_team.loc[vals.index, est_col].fillna(False).astype(bool).any())
-            if est_col in games_with_team.columns and not vals.empty else False
+            bool((games_with_team[est_col].fillna(False).astype(bool) & present[col]).any())
+            if est_col in games_with_team.columns else False
         )
     result["estimated"] = estimated
     return result
-
-
-def _stat_with_floor(vals: pd.Series, floor_q: float = 0.10) -> dict:
-    """
-    mean/std/cv_pct plus a "floor" = the floor_q percentile of the game log
-    (default 10th percentile). Not the true minimum -- one fluky game (early
-    exit, garbage-time DNP-ish line) shouldn't define "what to expect on a
-    bad night." The 10th percentile means "about 1 game in 10 is this bad
-    or worse," which is a much more usable idea of a realistic floor.
-
-    Also the 25th and 75th percentiles ("p25"/"p75"), the middle half of
-    the game log: a typical off night and a typical good one.
-    """
-    vals = vals.dropna()
-    if vals.empty:
-        return {"mean": None, "std": None, "cv_pct": None, "floor": None, "p25": None, "p75": None}
-    mean = vals.mean()
-    std = vals.std(ddof=1) if len(vals) > 1 else 0.0
-    cv_pct = (std / mean * 100) if mean else None
-    floor = vals.quantile(floor_q)
-    return {"mean": mean, "std": std, "cv_pct": cv_pct, "floor": floor,
-            "p25": vals.quantile(0.25), "p75": vals.quantile(0.75)}
 
 
 def _compute_consistency(games: pd.DataFrame) -> dict:
@@ -325,19 +314,47 @@ def _compute_consistency(games: pd.DataFrame) -> dict:
     averages 12 or 30 a game. CV is not computed for stats that can be
     ~zero or swing negative (see plus_minus_std in _stat_block instead).
 
-    Each stat also gets a "floor" and P25/P75 -- see _stat_with_floor.
+    Each stat also gets a "floor" and P25/P75 -- see _stats_with_floor.
     """
-    result = {stat: _stat_with_floor(games[stat]) for stat in CONSISTENCY_STATS}
-
     tsa_game = games["FGA"] + 0.44 * games["FTA"]
-    usage_game = tsa_game + games["TOV"]
-    ts_pct_game = (games["PTS"] / (2 * tsa_game)).replace([float("inf"), float("-inf")], None)
+    series = {stat: games[stat] for stat in CONSISTENCY_STATS}
+    series["TSA"] = tsa_game
+    series["USG_EVENTS"] = tsa_game + games["TOV"]
+    series["TS_PCT"] = (games["PTS"] / (2 * tsa_game)).replace([float("inf"), float("-inf")], None)
+    series["MIN"] = games["MIN_NUM"]
+    return _stats_with_floor(pd.DataFrame(series).astype(float))
 
-    for key, vals in [("TSA", tsa_game), ("USG_EVENTS", usage_game), ("TS_PCT", ts_pct_game),
-                       ("MIN", games["MIN_NUM"])]:
-        result[key] = _stat_with_floor(vals)
 
-    return result
+def _stats_with_floor(frame: pd.DataFrame, floor_q: float = 0.10) -> dict:
+    """
+    {column: mean/std/cv_pct plus a "floor"} for every column of the game
+    log `frame`, NaNs skipped. The floor is the floor_q percentile (default
+    10th) -- not the true minimum: one fluky game (early exit, garbage-time
+    DNP-ish line) shouldn't define "what to expect on a bad night." The 10th
+    percentile means "about 1 game in 10 is this bad or worse," which is a
+    much more usable idea of a realistic floor.
+
+    Also the 25th and 75th percentiles ("p25"/"p75"), the middle half of
+    the game log: a typical off night and a typical good one.
+
+    One mean/std/quantile pass over the whole frame rather than one per
+    column -- per column was most of what the consistency rows cost.
+    """
+    counts = frame.count()
+    means, stds = frame.mean(), frame.std(ddof=1)
+    quantiles = frame.quantile([floor_q, 0.25, 0.75])
+    out = {}
+    for col in frame.columns:
+        if not counts[col]:
+            out[col] = {"mean": None, "std": None, "cv_pct": None, "floor": None, "p25": None, "p75": None}
+            continue
+        mean = means[col]
+        std = stds[col] if counts[col] > 1 else 0.0
+        out[col] = {
+            "mean": mean, "std": std, "cv_pct": (std / mean * 100) if mean else None,
+            "floor": quantiles.at[floor_q, col], "p25": quantiles.at[0.25, col], "p75": quantiles.at[0.75, col],
+        }
+    return out
 
 
 def _stat_block(games: pd.DataFrame, game_minutes: float = 48) -> dict | None:
@@ -347,42 +364,67 @@ def _stat_block(games: pd.DataFrame, game_minutes: float = 48) -> dict | None:
     if games.empty:
         return None
 
-    gp = len(games)
-    minutes = games["MIN_NUM"].sum()
-    minutes_per_game = minutes / gp
-    totals = {c: games[c].sum() for c in COUNTING_STATS}
-
-    per_game = {c: totals[c] / gp for c in COUNTING_STATS}
-    per_36 = {c: (totals[c] / minutes) * 36 if minutes else 0.0 for c in COUNTING_STATS}
-
-    fga, fgm, fg3m, fta, ftm = totals["FGA"], totals["FGM"], totals["FG3M"], totals["FTA"], totals["FTM"]
-    shooting = {
-        "FG_PCT": fgm / fga if fga else None,
-        "FG3_PCT": totals["FG3M"] / totals["FG3A"] if totals["FG3A"] else None,
-        "FT_PCT": ftm / fta if fta else None,
-        "EFG_PCT": (fgm + 0.5 * fg3m) / fga if fga else None,
-        # true shooting: points per shooting possession
-        "TS_PCT": totals["PTS"] / (2 * (fga + 0.44 * fta)) if (fga or fta) else None,
-    }
-
-    wins = int((games["WL"] == "W").sum()) if "WL" in games.columns else None
-    losses = int((games["WL"] == "L").sum()) if "WL" in games.columns else None
-
-    # True shot attempts = FGA + .44*FTA ("usage without the turnovers").
-    # Computed from totals, not averaged per-game -- same result since it's
-    # linear, and doesn't need team data the way usage%/USG Vol does.
-    tsa_per_game = (totals["FGA"] + 0.44 * totals["FTA"]) / gp
-
-    # Plus-minus can be ~zero or negative, which makes CV% (std/mean) blow up
-    # or flip sign nonsensically -- so this is a raw std dev, not a %.
-    plus_minus_std = games["PLUS_MINUS"].std(ddof=1) if "PLUS_MINUS" in games.columns and gp > 1 else None
-
     # usage% and team context need TEAM_* columns -- only present if this df
     # came from games_with_team_context(). Fall back to None otherwise.
     usage = _compute_usage(games) if "TEAM_MIN" in games.columns else None
     team = _compute_team_context(games, game_minutes) if "TEAM_PTS" in games.columns else None
     possessions = _compute_per_100(games) if "TEAM_MIN" in games.columns else None
-    team_box = _compute_team_box(games)
+    return {
+        **_box_block(games),
+        # Per-100 is None (not zeros) whenever no game in the span has the
+        # team possession columns -- i.e. anything before 1977. Callers must
+        # treat it as optional the way they already do "usage"/"team".
+        "per_100": possessions["per_100"] if possessions else None,
+        "possessions": possessions,
+        "usage": usage,
+        "team": team,
+        "team_box": _compute_team_box(games),
+        "consistency": _compute_consistency(games),
+    }
+
+
+def _box_block(games: pd.DataFrame) -> dict:
+    """The part of _stat_block read straight off the player's own box score
+    -- games, minutes, W/L, per-game/per-36, shooting, plus-minus. No team
+    columns needed, and cheap enough that league.py always computes it.
+
+    Every average is over the games that recorded that stat, and every rate
+    over the games with all its parts (see box.py) -- the early logs leave
+    minutes, attempts, rebounds and assists blank for some games.
+    "coverage" is how many games each number stands on, for the table's
+    partial-coverage mark. Per-36 is the stat's per-game average over the
+    minutes' -- the Per 36 preset's own formula -- so each half uses all the
+    games that have it."""
+    gp = len(games)
+    b = _box.box_sums(games)
+    per_game = _box.per_game(b)
+    totals = {c: b["sums"][c] if b["counts"][c] else None for c in COUNTING_STATS}
+    minutes_recorded = b["counts"]["MIN_NUM"]
+    minutes = b["sums"]["MIN_NUM"] if minutes_recorded else None
+    minutes_per_game = minutes / minutes_recorded if minutes_recorded else None
+    per_36 = {
+        c: per_game[c] * 36 / minutes_per_game if per_game[c] is not None and minutes_per_game else None
+        for c in COUNTING_STATS
+    }
+    shooting = _box.shooting(b)
+    tsa, tsa_games = b["matched"]["TSA"]
+    coverage = {
+        "MIN": minutes_recorded,
+        **{c: b["counts"][c] for c in COUNTING_STATS},
+        **{key: n for key, (_, n) in b["matched"].items()},
+    }
+
+    wins = int((games["WL"] == "W").sum()) if "WL" in games.columns else None
+    losses = int((games["WL"] == "L").sum()) if "WL" in games.columns else None
+
+    # True shot attempts = FGA + .44*FTA ("usage without the turnovers"),
+    # over the games with both recorded -- and, unlike usage%/USG Vol, no
+    # team data needed.
+    tsa_per_game = (tsa["FGA"] + 0.44 * tsa["FTA"]) / tsa_games if tsa_games else None
+
+    # Plus-minus can be ~zero or negative, which makes CV% (std/mean) blow up
+    # or flip sign nonsensically -- so this is a raw std dev, not a %.
+    plus_minus_std = games["PLUS_MINUS"].std(ddof=1) if "PLUS_MINUS" in games.columns and gp > 1 else None
 
     return {
         "games": gp,
@@ -393,17 +435,9 @@ def _stat_block(games: pd.DataFrame, game_minutes: float = 48) -> dict | None:
         "totals": totals,
         "per_game": per_game,
         "per_36": per_36,
-        # Per-100 is None (not zeros) whenever no game in the span has the
-        # team possession columns -- i.e. anything before 1977. Callers must
-        # treat it as optional the way they already do "usage"/"team".
-        "per_100": possessions["per_100"] if possessions else None,
-        "possessions": possessions,
         "shooting": shooting,
         "tsa_per_game": tsa_per_game,
-        "usage": usage,
-        "team": team,
-        "team_box": team_box,
-        "consistency": _compute_consistency(games),
+        "coverage": coverage,
         "plus_minus_per_game": games["PLUS_MINUS"].mean() if "PLUS_MINUS" in games.columns else None,
         "plus_minus_std": plus_minus_std,
         # Plus-minus isn't recorded before NBA 1996-97 / WNBA 2008, and both

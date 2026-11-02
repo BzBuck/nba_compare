@@ -569,8 +569,10 @@ def _schedule_length(store: NBADataStore, season: int) -> int | None:
 
 
 def _season_gp_pct(table: pd.DataFrame, store: NBADataStore) -> pd.Series:
-    sched = pd.Series({s: _schedule_length(store, int(s)) for s in table.index}, dtype=float)
-    return 100 * table["GP"] / sched
+    # The table's index is SEASON, or (PLAYER_ID, SEASON) for a league table.
+    seasons = table.index.get_level_values("SEASON")
+    sched = {s: _schedule_length(store, int(s)) for s in seasons.unique()}
+    return 100 * table["GP"] / pd.Series(seasons.map(sched), index=table.index, dtype=float)
 
 
 # Season-level fields: getter(per-season table, store) -> Series indexed by
@@ -590,19 +592,18 @@ SEASON_FIELDS: dict[str, FieldDef] = {
 }
 
 
-def seasons_passing(games: pd.DataFrame, store: NBADataStore, conditions: tuple[Condition, ...]) -> list[int]:
-    """
-    The seasons in `games` (one span's FULL regular-season games -- see
-    compare.qualifying_seasons) that meet every season condition. A season
-    with no regular-season games at all can't be judged and doesn't pass.
-    """
-    if games.empty:
-        return []
-    by_season = games.groupby("SEASON")
-    table = pd.DataFrame({"GP": by_season.size(), "MIN/G": by_season["MIN_NUM"].mean()})
+def _season_table(games: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """GP and MIN/G (plus a duo's A_/B_ MIN/G) per group of `keys` -- the
+    table SEASON_FIELDS getters read."""
+    grouped = games.groupby(keys)
+    table = pd.DataFrame({"GP": grouped.size(), "MIN/G": grouped["MIN_NUM"].mean()})
     if "A_MIN_NUM" in games.columns:
-        table["A_MIN/G"] = by_season["A_MIN_NUM"].mean()
-        table["B_MIN/G"] = by_season["B_MIN_NUM"].mean()
+        table["A_MIN/G"] = grouped["A_MIN_NUM"].mean()
+        table["B_MIN/G"] = grouped["B_MIN_NUM"].mean()
+    return table
+
+
+def _season_mask(table: pd.DataFrame, store: NBADataStore, conditions: tuple[Condition, ...]) -> pd.Series:
     mask = pd.Series(True, index=table.index)
     for c in conditions:
         fd = SEASON_FIELDS.get(c.field)
@@ -613,4 +614,30 @@ def seasons_passing(games: pd.DataFrame, store: NBADataStore, conditions: tuple[
                 mask &= _holds(table[col], c.op, c.value)
         else:
             mask &= _holds(fd.getter(table, store), c.op, c.value)
-    return sorted(int(s) for s in table.index[mask])
+    return mask
+
+
+def seasons_passing(games: pd.DataFrame, store: NBADataStore, conditions: tuple[Condition, ...]) -> list[int]:
+    """
+    The seasons in `games` (one span's FULL regular-season games -- see
+    compare.qualifying_seasons) that meet every season condition. A season
+    with no regular-season games at all can't be judged and doesn't pass.
+    """
+    if games.empty:
+        return []
+    table = _season_table(games, ["SEASON"])
+    return sorted(int(s) for s in table.index[_season_mask(table, store, conditions)])
+
+
+def player_seasons_passing(
+    games: pd.DataFrame, store: NBADataStore, conditions: tuple[Condition, ...],
+) -> pd.MultiIndex:
+    """
+    seasons_passing() for every player in `games` at once (a whole league's
+    FULL regular-season games): the (PLAYER_ID, SEASON) pairs that meet
+    every season condition. What league.py keeps rows to.
+    """
+    if games.empty:
+        return pd.MultiIndex.from_arrays([[], []], names=["PLAYER_ID", "SEASON"])
+    table = _season_table(games, ["PLAYER_ID", "SEASON"])
+    return table.index[_season_mask(table, store, conditions)]

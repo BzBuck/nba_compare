@@ -10,9 +10,10 @@ from . import session_config
 from . import playoffs
 from . import percentiles
 from . import filters
+from . import league
 
 __all__ = [
     "PlayerSpan", "DuoSpan", "NBADataStore", "compare_spans", "aggregate_span",
     "aggregate_duo_span", "ComparisonResult", "AccoladeStore", "viz", "table",
-    "players", "formulas", "session_config", "playoffs", "percentiles", "filters",
+    "players", "formulas", "session_config", "playoffs", "percentiles", "filters", "league",
 ]

@@ -12,6 +12,7 @@ import dataclasses
 import uuid
 import streamlit as st
 from streamlit_sortables import sort_items
+from st_aggrid import AgGrid, JsCode
 
 import pandas as pd
 
@@ -38,6 +39,10 @@ from nba_compare.filters import (
 from nba_compare.playoffs import (
     render_series_table_html, build_series_table, SERIES_COLUMN_DEFS, DEFAULT_SERIES_COLUMNS,
     round_labels_present, build_round_comparison_table,
+)
+from nba_compare.league import (
+    ROW_UNITS, LeagueQuery, LeagueRows, league_rows, family_values, families_for, family_is_slow,
+    family_applies, plan, estimate_seconds, build_league_table, FAMILY_NAMES,
 )
 
 st.set_page_config(page_title="Basketball Compare", layout="wide")
@@ -132,6 +137,37 @@ if "user_presets" not in st.session_state:
         st.session_state["_preset_msg"] = (
             "warning", f"Dropped saved preset(s) whose stats no longer exist: {', '.join(_dropped)}.",
         )
+
+
+# ---------- view: compare players or league table ----------
+
+APP_MODES = {"Individual": "Compare players", "League": "League table"}
+if "_pending_app_mode" in st.session_state:
+    st.session_state["app_mode"] = st.session_state.pop("_pending_app_mode")
+if st.session_state.get("app_mode") not in APP_MODES:
+    st.session_state["app_mode"] = "Individual"
+app_mode = st.session_state["app_mode"]
+
+# The comparison's widgets aren't drawn in the league table, and Streamlit
+# drops an undrawn widget's state -- which would empty every player row. So
+# their values are stashed on the way into the league table and put back on
+# the way out (ranges through _pending_ranges, the same way Load setup does).
+SPAN_WIDGET_PREFIXES = (
+    "mode", "q", "match", "reg", "po", "label", "range",
+    "qa", "matcha", "qb", "matchb", "range_duo", "reg_duo", "po_duo", "label_duo",
+)
+if app_mode == "League":
+    if "_individual_stash" not in st.session_state:
+        _keys = ["league_mode", "h2h_mode"] + [
+            f"{prefix}_{cfg['id']}" for cfg in st.session_state.spans for prefix in SPAN_WIDGET_PREFIXES
+        ]
+        st.session_state["_individual_stash"] = {k: st.session_state[k] for k in _keys if k in st.session_state}
+elif "_individual_stash" in st.session_state:
+    for _key, _value in st.session_state.pop("_individual_stash").items():
+        if _key.startswith("range_"):
+            st.session_state.setdefault("_pending_ranges", {})[_key.rsplit("_", 1)[1]] = _value
+        else:
+            st.session_state[_key] = _value
 
 
 def set_user_presets(presets: list[dict]) -> str | None:
@@ -339,14 +375,36 @@ def remove_span(span_id: str):
 
 
 league_mode = st.session_state["league_mode"]
-st.title(f"{'NBA / WNBA' if league_mode == 'Both' else league_mode} Player / Span Comparison")
-st.radio(
-    "League", LEAGUE_MODES, key="league_mode", horizontal=True,
-    help="Which league's players to search. **Both** lets an NBA player sit next to a WNBA "
-         "player -- each is still measured against their own league (%ile, relative "
-         "shooting, pace, playoff rounds).",
+if st.session_state.get("lg_league") not in data_config.LEAGUES:
+    st.session_state["lg_league"] = st.session_state.get("_lg_saved", {}).get("lg_league") or (
+        league_mode if league_mode in data_config.LEAGUES else data_config.DEFAULT_LEAGUE
+    )
+if app_mode == "League":
+    st.title(f"{st.session_state['lg_league']} League Table")
+else:
+    st.title(f"{'NBA / WNBA' if league_mode == 'Both' else league_mode} Player / Span Comparison")
+view_cols = st.columns([1, 2])
+view_cols[0].radio(
+    "View", list(APP_MODES), key="app_mode", horizontal=True, format_func=APP_MODES.get,
+    help="**Compare players**: the players and spans you pick, side by side. **League table**: "
+         "every player in a league, one row each, sortable by any stat.",
 )
-directory = directory_for(league_mode)
+if app_mode == "League":
+    view_cols[1].radio(
+        "League", data_config.LEAGUES, key="lg_league", horizontal=True,
+        help="One league at a time -- NBA and WNBA rows in one table would need their numbers "
+             "put on one scale first.",
+    )
+    st.session_state.setdefault("_lg_saved", {})["lg_league"] = st.session_state["lg_league"]
+    directory = directory_for(st.session_state["lg_league"])
+else:
+    view_cols[1].radio(
+        "League", LEAGUE_MODES, key="league_mode", horizontal=True,
+        help="Which league's players to search. **Both** lets an NBA player sit next to a WNBA "
+             "player -- each is still measured against their own league (%ile, relative "
+             "shooting, pace, playoff rounds).",
+    )
+    directory = directory_for(league_mode)
 
 
 def player_row(player_id: int, directory: pd.DataFrame = directory):
@@ -384,26 +442,33 @@ def seasons_together_for(player_a_id: int, player_b_id: int, directory: pd.DataF
 # span's widget state (q_/match_/range_/reg_/po_/label_) BEFORE those
 # widgets render this run -- that's how the loaded values end up shown.
 
+def _comparison_state() -> dict:
+    """The comparison's widget values -- from session state, or from the
+    stash while the league table is showing (see _individual_stash)."""
+    return {**st.session_state.to_dict(), **st.session_state.get("_individual_stash", {})}
+
+
 def _build_span_dicts_from_session() -> list[dict]:
     """Reads the currently-filled-in Player-mode rows back out of
     session_state, in the plain-dict shape session_config.py expects.
     Skips any row that never got a player picked (an empty '+ Add player /
     span' row) or is in Duo mode."""
+    state = _comparison_state()
     out = []
     for cfg in st.session_state.spans:
         sid = cfg["id"]
-        if st.session_state.get(f"mode_{sid}", "Player") != "Player":
+        if state.get(f"mode_{sid}", "Player") != "Player":
             continue
         match_key, range_key = f"match_{sid}", f"range_{sid}"
-        if match_key not in st.session_state or range_key not in st.session_state:
+        if match_key not in state or range_key not in state:
             continue
-        player_id = st.session_state[match_key]
+        player_id = state[match_key]
         row = player_row(player_id)
         if row is None:
             continue
         name = row.PLAYER_NAME
         seasons_played = seasons_for(player_id)
-        lo, hi = st.session_state[range_key]
+        lo, hi = state[range_key]
         season_list = [s for s in seasons_played if lo <= s <= hi]
         if not season_list:
             continue
@@ -411,30 +476,31 @@ def _build_span_dicts_from_session() -> list[dict]:
             "player_id": player_id,
             "player_name": name,
             "seasons": season_list,
-            "label": st.session_state.get(f"label_{sid}") or None,
-            "include_regular": st.session_state.get(f"reg_{sid}", True),
-            "include_playoffs": st.session_state.get(f"po_{sid}", True),
+            "label": state.get(f"label_{sid}") or None,
+            "include_regular": state.get(f"reg_{sid}", True),
+            "include_playoffs": state.get(f"po_{sid}", True),
         })
     return out
 
 
 def _build_duo_dicts_from_session() -> list[dict]:
     """Same idea as _build_span_dicts_from_session(), but for Duo-mode rows."""
+    state = _comparison_state()
     out = []
     for cfg in st.session_state.spans:
         sid = cfg["id"]
-        if st.session_state.get(f"mode_{sid}", "Player") != "Duo":
+        if state.get(f"mode_{sid}", "Player") != "Duo":
             continue
         matcha_key, matchb_key, range_key = f"matcha_{sid}", f"matchb_{sid}", f"range_duo_{sid}"
-        if matcha_key not in st.session_state or matchb_key not in st.session_state or range_key not in st.session_state:
+        if matcha_key not in state or matchb_key not in state or range_key not in state:
             continue
-        player_a_id, player_b_id = st.session_state[matcha_key], st.session_state[matchb_key]
+        player_a_id, player_b_id = state[matcha_key], state[matchb_key]
         row_a, row_b = player_row(player_a_id), player_row(player_b_id)
         if row_a is None or row_b is None or player_a_id == player_b_id:
             continue
         name_a, name_b = row_a.PLAYER_NAME, row_b.PLAYER_NAME
         overlap = seasons_together_for(player_a_id, player_b_id)
-        lo, hi = st.session_state[range_key]
+        lo, hi = state[range_key]
         season_list = [s for s in overlap if lo <= s <= hi]
         if not season_list:
             continue
@@ -444,9 +510,9 @@ def _build_duo_dicts_from_session() -> list[dict]:
             "player_b_id": player_b_id,
             "player_b_name": name_b,
             "seasons": season_list,
-            "label": st.session_state.get(f"label_duo_{sid}") or None,
-            "include_regular": st.session_state.get(f"reg_duo_{sid}", True),
-            "include_playoffs": st.session_state.get(f"po_duo_{sid}", True),
+            "label": state.get(f"label_duo_{sid}") or None,
+            "include_regular": state.get(f"reg_duo_{sid}", True),
+            "include_playoffs": state.get(f"po_duo_{sid}", True),
         })
     return out
 
@@ -460,8 +526,8 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
             stat_order=st.session_state.get("stat_order", []),
             custom_formulas=st.session_state.get("custom_formulas", []),
             user_presets=st.session_state.get("user_presets", []),
-            head_to_head=st.session_state.get("h2h_mode", False),
-            league_mode=league_mode,
+            head_to_head=_comparison_state().get("h2h_mode", False),
+            league_mode=_comparison_state().get("league_mode", league_mode),
             game_filter={"enabled": st.session_state.get("gf_on", True), **game_filter_from_state().to_dict()},
         )
         st.session_state["_last_save_code"] = code
@@ -568,6 +634,10 @@ with st.sidebar.expander("Save / Load setup", expanded=False):
 
             st.session_state["h2h_mode"] = cfg["head_to_head"]
             st.session_state["_pending_league_mode"] = cfg["league_mode"]
+            # A save is a set of players: show them, and don't let rows stashed
+            # by the league table (see above) overwrite what was just loaded.
+            st.session_state["_pending_app_mode"] = "Individual"
+            st.session_state.pop("_individual_stash", None)
             set_game_filter_state(
                 GameFilter.from_dict(cfg["game_filter"]), enabled=cfg["game_filter"].get("enabled", True) is not False,
             )
@@ -665,6 +735,690 @@ for f in st.session_state.custom_formulas:
         f.get("fmt", DEFAULT_FORMULA_FMT),
         f.get("lower", False),
     )
+
+# ---------- sections shared by both views ----------
+# The game filters, stat presets/picker and table notes are the same widgets
+# in the comparison and the league table -- same keys, so whatever is set up
+# in one view is still set up in the other.
+
+INDIVIDUAL_FILTER_INTRO = (
+    "Only count games that pass **every** condition below -- for all rows, regular season "
+    "and playoffs alike. Opponent W% and seed are the opponent's regular-season record "
+    "that season. In head-to-head, conditions are read from the first row's side "
+    "(a \"W\" is a game it won), and player conditions like MIN must hold for both rows."
+)
+
+
+def current_game_filter() -> GameFilter:
+    return game_filter_from_state() if st.session_state.get("gf_on", True) else GameFilter()
+
+
+def render_game_filters(filter_leagues: set[str], directory: pd.DataFrame, show_league: bool, intro: str):
+    """The "Game filters" expander. filter_leagues: whose teams the opponent
+    picker lists; show_league: tag opponent players with their league (when
+    the player search covers both)."""
+    with st.expander("Game filters", expanded=False):
+        st.caption(intro)
+        if "gf_on" not in st.session_state:
+            st.session_state.gf_on = True
+        st.toggle("Apply game filters", key="gf_on",
+                  help="Switch off to see the unfiltered numbers without losing the filters set up here.")
+
+        st.markdown("**Season qualifiers**")
+        st.caption(
+            "Keep or drop **whole seasons**, judged on the full regular season before any game "
+            "filter below (a duo: the games they shared). A dropped season loses its playoff games "
+            "too. Only availability and role are offered -- a cutoff on production like PTS/G would "
+            "guarantee the very number being compared."
+        )
+        render_quick_buttons(QUICK_SEASON_FILTERS, "season", per_row=3)
+        render_condition_rows("season", "+ Add season qualifier")
+
+        st.divider()
+        st.markdown("**Game conditions**")
+        st.caption("Quick add:")
+        render_quick_buttons(QUICK_FILTERS, "game")
+        render_condition_rows("game", "+ Add condition")
+
+        st.divider()
+        cat_cols = st.columns(3)
+        cat_cols[0].radio("Location", LOCATIONS, key="gf_location", horizontal=True)
+        cat_cols[1].radio("Result", RESULTS, key="gf_result", horizontal=True)
+        cat_cols[2].radio("Game length", GAME_LENGTHS, key="gf_length", horizontal=True)
+
+        opp_cols = st.columns([2, 1, 4])
+        opp_cols[0].radio(
+            "Opponent conference", OPP_CONFERENCES, key="gf_opp_conf", horizontal=True,
+            format_func=lambda c: {"Same": "Own conf.", "Other": "Other conf."}.get(c, c),
+            help="Uses today's conference alignment for every season (realignments like Milwaukee "
+                 "moving East in 1980 aren't modeled), and teams from before the conference table's "
+                 "coverage fail East/West.",
+        )
+        opp_cols[1].radio("Opponents", OPPONENT_MODES, key="gf_opp_mode",
+                          format_func=lambda m: "Only vs." if m == "Only" else "Exclude")
+        opp_options = sorted(
+            {abbr for lg in filter_leagues for abbr in get_team_abbreviations(lg)}
+            | set(st.session_state.get("gf_opponents", []))
+        )
+        opp_cols[2].multiselect(
+            "Teams", opp_options, key="gf_opponents", placeholder="Any opponent",
+            help="Abbreviations as they appeared at the time -- a relocated franchise is listed "
+                 "under each of its names (e.g. SEA and OKC), so pick all you mean.",
+        )
+
+        st.divider()
+        st.markdown("**Opponent players & season finish**")
+        st.caption(
+            "Like head-to-head, but for any number of rows: only games where the players picked here "
+            "were on the **other** team with 10+ minutes. *Season finish* is how far a team went in "
+            "that season's playoffs, counted back from the Finals like the rounds below (*Last 4* = "
+            "the conference finals in a 4-round NBA year) and cumulative (*Made last 4* includes the "
+            "Finalists) -- so \"opponent won title\" also keeps regular-season games against the "
+            "eventual champion."
+        )
+        # Picker keys are "LEAGUE:ID", since the two leagues' ids are separate
+        # lists. A player picked under another league setting stays selected,
+        # named from gf_vs_names.
+        vs_names = dict(zip(directory.LEAGUE + ":" + directory.PLAYER_ID.astype(str), directory.PLAYER_NAME))
+        vs_names |= {k: v for k, v in st.session_state.get("gf_vs_names", {}).items() if k not in vs_names}
+        vs_options = list(vs_names)
+        vs_cols = st.columns([1, 4])
+        vs_cols[0].radio(
+            "Match", VS_PLAYER_MODES, key="gf_vs_mode",
+            format_func={"Any": "vs. any of", "All": "vs. all of", "None": "vs. none of"}.get,
+            help="*All of* keeps games where every player picked was on the other team at once.",
+        )
+        vs_cols[1].multiselect(
+            "Opponent players", vs_options, key="gf_vs_players", placeholder="Type a name…",
+            format_func=lambda k: f"{vs_names[k]} ({k.split(':')[0]})" if show_league else vs_names[k],
+        )
+        st.session_state.gf_vs_names = {k: vs_names[k] for k in st.session_state.get("gf_vs_players", [])}
+        fin_cols = st.columns(2)
+        fin_cols[0].selectbox(
+            "Opponent's season", list(SEASON_FINISHES), key="gf_opp_finish", format_func=SEASON_FINISHES.get,
+            help="Only games against teams that went this far that season.",
+        )
+        fin_cols[1].selectbox(
+            "Own team's season", list(SEASON_FINISHES), key="gf_team_finish", format_func=SEASON_FINISHES.get,
+            help="Only games for a team (this row's team) that went this far that season -- e.g. a "
+                 "player's title runs.",
+        )
+
+        st.divider()
+        st.markdown("**Playoff games**")
+        st.caption(
+            "These only narrow **playoff** games -- the regular-season table is untouched. Rounds count "
+            "back from the Finals, so *Last 4* is the conference finals in a 4-round NBA year and the "
+            "semifinals in the WNBA. A *closeout* game is one a win would clinch, an *elimination* game "
+            "one a loss would end; a Game 7 is both (*winner-take-all*). Series length is read off the "
+            "result (a 4-2 series was best-of-7)."
+        )
+        po_cols = st.columns([2, 1, 2])
+        po_cols[0].multiselect(
+            "Round", list(PLAYOFF_ROUNDS), key="gf_po_rounds", format_func=PLAYOFF_ROUNDS.get,
+            placeholder="Every round",
+        )
+        po_cols[1].radio("Series home court", SERIES_HOME_COURT, key="gf_po_home",
+                         help="Whether this row's team had home-court advantage in the series "
+                              "(hosted Game 1) -- not whether this game was at home; that's Location above.")
+        po_cols[2].radio("Series situation", SERIES_SITUATIONS, key="gf_po_situation", horizontal=True)
+        st.caption("Quick add -- each one adds a playoffs-only row under Game conditions above:")
+        render_quick_buttons(QUICK_PLAYOFF_FILTERS, "game", per_row=3)
+
+        st.button("Clear all filters", on_click=set_game_filter_state, args=(GameFilter(),))
+
+
+def _all_presets() -> list[dict]:
+    return BUILTIN_PRESETS + st.session_state.user_presets
+
+
+def _on_preset_pick():
+    name = st.session_state.get("preset_pick")
+    preset = next((p for p in _all_presets() if p["name"] == name), None)
+    if preset is None:
+        return  # clicking the active preset again just deselects it -- nothing to change
+    formulas, order = apply_preset(preset, st.session_state.custom_formulas)
+    st.session_state.custom_formulas = formulas
+    st.session_state.stat_order = order
+    st.session_state.selected_stats = list(order)
+
+
+def _save_user_preset():
+    name = st.session_state.get("new_preset_name", "").strip()
+    if not name:
+        st.session_state["_preset_msg"] = ("error", "Give the preset a name.")
+    elif name in BUILTIN_PRESET_NAMES:
+        st.session_state["_preset_msg"] = ("error", f"'{name}' is a built-in preset — pick a different name.")
+    elif not st.session_state.stat_order:
+        st.session_state["_preset_msg"] = ("error", "Pick some stats to save first.")
+    else:
+        preset = preset_from_current(name, st.session_state.stat_order, st.session_state.custom_formulas)
+        others = [p for p in st.session_state.user_presets if p["name"] != name]
+        replaced = len(others) != len(st.session_state.user_presets)
+        err = set_user_presets(others + [preset])
+        st.session_state.new_preset_name = ""
+        st.session_state["_preset_msg"] = ("error", err) if err else (
+            "success", f"{'Updated' if replaced else 'Saved'} preset '{name}'.",
+        )
+
+
+def _delete_user_preset(name: str):
+    err = set_user_presets([p for p in st.session_state.user_presets if p["name"] != name])
+    if err:
+        st.session_state["_preset_msg"] = ("error", err)
+
+
+def _import_presets_file():
+    upload = st.session_state.get("preset_import")
+    if upload is None:
+        return
+    try:
+        imported, dropped = presets_from_json(upload.getvalue())
+    except ValueError as e:
+        st.session_state["_preset_msg"] = ("error", str(e))
+        return
+    err = set_user_presets(restore_user_presets(st.session_state.user_presets + imported)[0])
+    msg = f"Imported {len(imported)} preset(s)" + (f": {', '.join(p['name'] for p in imported)}." if imported else ".")
+    if dropped:
+        msg += f" Dropped (no stats left, or named like a built-in): {', '.join(dropped)}."
+    st.session_state["_preset_msg"] = ("error", err) if err else ("success", msg)
+
+
+def render_stat_picker(view: str, format_stat=None, picker_note: str | None = None) -> list[str]:
+    """Stat presets and the "Customize stats shown" picker. Returns the chosen
+    stats in order. format_stat: how an option reads in the picker (the
+    league table marks slow ones); picker_note: a caption under it."""
+    # Reflect which preset (if any) the current rows match, so the pill
+    # shows as active until the stats are edited by hand. Set before the
+    # widget renders, which is the only point Streamlit allows it.
+    presets = _all_presets()
+    st.session_state.preset_pick = matching_preset(st.session_state.stat_order, presets)
+    st.pills(
+        "Stat presets", [p["name"] for p in presets], selection_mode="single",
+        key="preset_pick", on_change=_on_preset_pick,
+        help="Swap the table to a themed set of stats. Presets add the custom formulas they "
+             "need and remove them again when you switch; your own formulas are never touched.",
+    )
+
+    with st.expander("Customize stats shown", expanded=False):
+        available_labels = list(combined_stat_defs.keys())
+
+        # Options that read differently (the league table marks slow stats)
+        # are a new widget to Streamlit, which would start it empty -- so it's
+        # re-seeded from stat_order whenever the view changes, the same way
+        # adding a formula re-seeds it.
+        if "selected_stats" not in st.session_state or st.session_state.get("_picker_view") != view:
+            st.session_state.selected_stats = [s for s in st.session_state.stat_order if s in available_labels]
+            st.session_state["_picker_view"] = view
+
+        selected = st.multiselect(
+            "Stats to show (box score, usage, team, consistency, and your custom stats)",
+            options=available_labels,
+            key="selected_stats",
+            format_func=format_stat or str,
+        )
+        if picker_note:
+            st.caption(picker_note)
+
+        # Keep stat_order in sync with the current selection (add newly
+        # picked stats at the end, drop deselected ones) before reordering.
+        ordered_selection = [s for s in st.session_state.stat_order if s in selected]
+        ordered_selection += [s for s in selected if s not in ordered_selection]
+        st.session_state.stat_order = ordered_selection
+
+        st.caption("Drag to reorder:")
+        if ordered_selection:
+            # Key depends on WHICH stats are selected (not their order), so
+            # the component only remounts -- and re-syncs to the correct
+            # item list -- when you add/remove a stat, not on every drag.
+            sorter_key = "stat_order_sorter_" + "|".join(sorted(ordered_selection))
+            new_order = sort_items(ordered_selection, key=sorter_key)
+            # Defensive: only trust the component's output if it's actually
+            # a reordering of what we gave it. A stale response (e.g. the
+            # frontend hasn't caught up with a selection change yet) would
+            # otherwise get written into stat_order and corrupt every
+            # future run, since nothing else resets it.
+            if new_order and set(new_order) == set(ordered_selection):
+                st.session_state.stat_order = new_order
+            else:
+                st.session_state.stat_order = ordered_selection
+        stat_labels = st.session_state.stat_order
+
+        st.divider()
+        preset_cols = st.columns([3, 1])
+        preset_cols[0].text_input(
+            "Save these stats as a preset", key="new_preset_name", placeholder="Preset name",
+            help="Saves the stats above, in this order, plus any custom formulas they use. "
+                 f"Saving under an existing name updates it. Presets are saved to "
+                 f"{user_presets_path()} and come back after a refresh; they're also kept in your save code.",
+        )
+        preset_cols[1].button("Save preset", on_click=_save_user_preset, use_container_width=True)
+        msg = st.session_state.pop("_preset_msg", None)
+        if msg:
+            {"error": st.error, "warning": st.warning}.get(msg[0], st.success)(msg[1])
+        for p in st.session_state.user_presets:
+            cols = st.columns([4, 1])
+            cols[0].caption(f"**{p['name']}** — {len(p['stats'])} stats")
+            cols[1].button("✕", key=f"del_user_preset_{p['name']}",
+                           on_click=_delete_user_preset, args=(p["name"],))
+        io_cols = st.columns(2)
+        io_cols[0].download_button(
+            "Export presets", data=presets_to_json(st.session_state.user_presets),
+            file_name="nba_compare_presets.json", mime="application/json",
+            disabled=not st.session_state.user_presets, use_container_width=True,
+            help="Download your presets as a file, to back them up or move them to another machine.",
+        )
+        io_cols[1].file_uploader(
+            "Import presets", type=["json"], key="preset_import", on_change=_import_presets_file,
+            help="Add presets from an exported file. One with the same name as a saved preset replaces it.",
+        )
+    return stat_labels
+
+
+def render_stat_notes(stat_labels: list[str], mixed_leagues: bool = False, head_to_head: bool = False):
+    """The explanatory notes under a stat table, for whichever stat families it shows."""
+    if any(lbl.endswith("/100") or lbl == "Poss/G" for lbl in stat_labels):
+        st.caption(
+            "**/100** = per 100 team possessions the player was on the floor for, using that "
+            "team's own measured pace over these exact games — the pace-aware counterpart to "
+            "/36, which can't tell a 100-possession game from an 85-possession one. Possessions "
+            "come out of the team box score, so these rows are blank for NBA seasons before 1977: "
+            "turnovers weren't recorded, and without them there's no possession estimate to make."
+        )
+    if any(lbl.endswith("/75") for lbl in stat_labels):
+        st.caption(
+            "**/75** = the /100 rate scaled to 75 possessions — the same pace adjustment, "
+            "at roughly a starter's per-game possession count, which is the usual baseline "
+            "for comparing players across eras."
+        )
+    if any(lbl.startswith(("Team ", "Opp ")) and lbl.endswith("/G") and lbl not in ("Team Poss/G",)
+           for lbl in stat_labels):
+        st.caption(
+            "**Team/Opp …/G** = the player's team's and its opponents' box score, per game, over "
+            "the games in this span. Each is averaged over the games that have it recorded; "
+            "before 1985 (NBA) most columns are rebuilt from player logs where possible, as are "
+            "WNBA team turnovers in 1997, 2000 and 2003 (footnoted)."
+        )
+    if any(lbl.startswith("Lg ") for lbl in stat_labels):
+        st.caption(
+            "**Lg …** = the league-average team's box score per game (and pace, TS%), over the whole "
+            "league for this span's seasons, weighted by the span's games in each season. Never "
+            "narrowed by game filters, and not highlighted -- it's context, mostly for formulas."
+        )
+    if any(lbl.endswith(("(P25)", "(P75)")) for lbl in stat_labels):
+        st.caption(
+            "**(P25)/(P75)** = the 25th and 75th percentile of the game log: half of the span's "
+            "games fall between them."
+        )
+    if any(lbl in ("OWS", "DWS", "WS", "WS/48") for lbl in stat_labels):
+        st.caption(
+            "**Win Shares** = Basketball-Reference's method: credit for team wins split into "
+            "offense (OWS, from Dean Oliver's points produced) and defense (DWS, from his "
+            "individual defensive rating), against that season's league averages. A plain "
+            "season or career uses the team's full-season totals, as Basketball-Reference does; "
+            "a filtered span, head-to-head or duo uses only its own games, so it's the wins "
+            "earned in those games. A duo's is the two players' own Win Shares added. WS/48 is "
+            "per 48 minutes in the WNBA too (Basketball-Reference shows WS/40 there). Blank for "
+            "NBA seasons before 1977-78, which have no player turnovers."
+        )
+    if mixed_leagues:
+        st.caption(
+            "**NBA and WNBA side by side**: each row is measured against its own league -- %ile "
+            "and relative shooting rank a WNBA season among WNBA players, and pace counts "
+            "possessions per 48 minutes in the NBA but per 40 in the WNBA. Raw counting stats "
+            "are straight comparisons, but WNBA games are 8 minutes shorter, so per-game "
+            "numbers favor the NBA; /36 and /100 even that out."
+        )
+    if any(lbl.endswith("CV%") for lbl in stat_labels):
+        st.caption(
+            "CV% = game-to-game standard deviation \u00f7 mean, as a percent. Lower means more "
+            "predictable output game to game; it isn't a judgment of good or bad for a given role."
+        )
+    if head_to_head:
+        st.caption(
+            "**Head-to-head**: only games where every player in both rows logged 10+ minutes, "
+            "with the two rows on opposite teams, within the seasons both rows cover -- so both "
+            "columns come from the same games, and W/L is the head-to-head record. A duo's "
+            "column is the two players' combined numbers, as in Duo mode, and only counts games "
+            "where both of them played. %ile rows show — here, since they rank whole seasons "
+            "and don't describe these games. The playoff series breakdown lists only the "
+            "series they met in."
+        )
+    if any(lbl.endswith("%ile") for lbl in stat_labels):
+        st.caption(
+            "%ile = where this stat ranks among qualifying players **in that same season and league** "
+            "(min. 10 games regular season, 1 game playoffs) -- 90 means better than ~90% of the "
+            "league that year. A span covering multiple seasons shows a games-weighted average "
+            "across those seasons. Turnovers are inverted so higher %ile always means better, "
+            "same as every other stat here. Duo spans show — for %ile rows -- percentiles "
+            "rank against individual players, so a combined duo total isn't a meaningful comparison."
+        )
+
+
+# ---------- league table ----------
+# The whole league in one sortable table, one row per player (or per
+# player-season) -- see league.py for how it's built and priced.
+
+LEAGUE_FILTER_INTRO = (
+    "Only count games that pass **every** condition below, for every player in the table. "
+    "Season qualifiers keep or drop each player's seasons one at a time. Opponent W% and "
+    "seed are the opponent's regular-season record that season."
+)
+SEASON_TYPE_NAMES = {"regular": "Regular season", "playoffs": "Playoffs"}
+
+# (query, family) -> family_values. One dict shared by every session rather
+# than a cached function per family, because plan() has to know which
+# families are already computed -- those cost nothing to show again.
+LEAGUE_FAMILY_CACHE_SIZE = 64
+
+
+@st.cache_resource
+def get_league_family_cache() -> dict:
+    return {}
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def get_league_rows(query: LeagueQuery) -> LeagueRows:
+    return league_rows(get_stores()[query.league], query)
+
+
+@st.cache_resource
+def get_league_seasons(league: str) -> list[int]:
+    return get_stores()[league].seasons("regular")
+
+
+def league_family_values(rows: LeagueRows, family: str, on_progress=None) -> dict:
+    cache = get_league_family_cache()
+    key = (rows.query, family)
+    if key not in cache:
+        cache[key] = family_values(rows, family, on_progress)
+        while len(cache) > LEAGUE_FAMILY_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+    return cache[key]
+
+
+def _restore_league_widget(key: str, default):
+    """League-table widgets aren't drawn in the comparison view, and Streamlit
+    drops an undrawn widget's state -- so each one's value is kept in
+    _lg_saved and put back before it's drawn again."""
+    if key not in st.session_state:
+        st.session_state[key] = st.session_state.setdefault("_lg_saved", {}).get(key, default)
+
+
+def _remember_league_widgets(*keys: str):
+    st.session_state.setdefault("_lg_saved", {}).update({k: st.session_state[k] for k in keys})
+
+
+def _confirm_league_families(query: LeagueQuery, held: frozenset):
+    st.session_state["_lg_confirmed"] = (query, held)
+
+
+# The league table is an AG Grid rather than st.dataframe for one reason: its
+# Rk column. st.dataframe sorts in the browser without telling Python the
+# order, so a rank computed here would ride along with its row when a header
+# is clicked. AG Grid's is read off each row's displayed position, and
+# refreshed after every sort -- 1 is always the top row, however it's sorted.
+_RANK_GETTER = JsCode("function(p) { return p.node.rowIndex == null ? null : p.node.rowIndex + 1; }")
+_RENUMBER = JsCode("function(e) { e.api.refreshCells({columns: ['rk'], force: true}); }")
+# A title row (league.LeagueRows: a player-season the player won it in, or
+# a series in a title run) is shaded gold. Translucent, so it reads in the
+# light and dark themes alike.
+CHAMPION_GOLD = "rgba(212, 175, 55, 0.30)"
+# Blank cells (a stat not recorded, or not loaded yet) sort last either way.
+# AG Grid flips the result for a descending sort, hence isDesc.
+_BLANKS_LAST = JsCode("""function(a, b, nodeA, nodeB, isDesc) {
+    var aBlank = a == null || isNaN(a), bBlank = b == null || isNaN(b);
+    if (aBlank && bBlank) return 0;
+    if (aBlank) return isDesc ? -1 : 1;
+    if (bBlank) return isDesc ? 1 : -1;
+    return a - b;
+}""")
+
+
+def _number_formatter(fmt: str) -> JsCode:
+    """A table format ("{:.1f}", "{:+.3f}") as an AG Grid valueFormatter."""
+    spec = fmt[2:-1] if fmt.startswith("{:") and fmt.endswith("}") else ".3f"
+    signed = spec.startswith("+")
+    decimals = int(spec.lstrip("+").lstrip(".").rstrip("f") or 0)
+    sign = "(p.value > 0 ? '+' : '') + " if signed else ""
+    return JsCode(
+        f"function(p) {{ return (p.value == null || isNaN(p.value)) ? '\u2014' : {sign}p.value.toFixed({decimals}); }}"
+    )
+
+
+def render_league_grid(table: pd.DataFrame, stat_cols: list[str], formats: dict, sort_col: str | None,
+                       descending: bool, height: int):
+    # Columns go to AG Grid under plain ids: a stat label like "PTS/G" or a
+    # formula name with a dot would read as a nested field path.
+    ids = {col: f"c{i}" for i, col in enumerate(table.columns)}
+    champion = ids["Champion"]
+    column_defs = [{
+        "headerName": "Rk", "colId": "rk", "valueGetter": _RANK_GETTER, "sortable": False,
+        "pinned": "left", "width": 64, "suppressMovable": True, "cellStyle": {"opacity": 0.6},
+    }]
+    for col in table.columns:
+        spec = {"headerName": col, "field": ids[col], "headerTooltip": col}
+        if col in stat_cols:
+            spec |= {
+                "type": "rightAligned", "comparator": _BLANKS_LAST,
+                "valueFormatter": _number_formatter(formats.get(col, DEFAULT_FORMULA_FMT)),
+                # Wide enough for the header plus its sort arrow.
+                "width": max(72, 8 * len(col) + 44),
+            }
+            if col == sort_col:
+                spec["sort"] = "desc" if descending else "asc"
+        elif col == "Champion":
+            spec["hide"] = True  # read by getRowStyle, not shown
+        else:
+            # Rk and Player stay put while the rest scrolls sideways.
+            spec |= {
+                "pinned": "left" if col == "Player" else None,
+                "width": {"Player": 190, "Season": 90, "Round": 120, "Opp": 70, "Series": 80}.get(col, 100),
+            }
+        column_defs.append(spec)
+    AgGrid(
+        table.rename(columns=ids),
+        gridOptions={
+            "columnDefs": column_defs,
+            "defaultColDef": {"sortable": True, "resizable": True},
+            # Every column in the DOM, not just those scrolled into view --
+            # a table is at most a few dozen columns.
+            "suppressColumnVirtualisation": True,
+            "onSortChanged": _RENUMBER,
+            "onFilterChanged": _RENUMBER,
+            "getRowStyle": JsCode(
+                f"function(p) {{ return p.data && p.data.{champion} ? {{background: '{CHAMPION_GOLD}'}} : null; }}"
+            ),
+            "suppressCellFocus": True,
+        },
+        height=height, theme="streamlit", allow_unsafe_jscode=True, update_on=[],
+        # A new set of columns starts a fresh grid (and its default sort).
+        key="lg_grid_" + "|".join(table.columns),
+    )
+
+
+def render_league_view():
+    league = st.session_state["lg_league"]
+    all_seasons = get_league_seasons(league)
+    saved = st.session_state.setdefault("_lg_saved", {})
+    st.caption(
+        "Every player's numbers for the seasons below, one row each -- click a column header to "
+        "sort. Stats, presets, custom formulas and game filters are the same ones the comparison uses."
+    )
+
+    cols = st.columns([2, 4, 2])
+    _restore_league_widget("lg_season_type", "regular")
+    season_type = cols[0].radio(
+        "Games", list(SEASON_TYPE_NAMES), key="lg_season_type", horizontal=True, format_func=SEASON_TYPE_NAMES.get,
+    )
+    # One remembered range per league -- their seasons aren't the same list.
+    range_key = f"lg_seasons_{league}"
+    default_range = saved.get(range_key)
+    if not default_range or not set(default_range) <= set(all_seasons):
+        default_range = (all_seasons[-1], all_seasons[-1])
+    lo, hi = cols[1].select_slider(
+        "Seasons", options=all_seasons, value=default_range, key=range_key,
+        format_func=lambda y: season_str(y, league),
+    )
+    seasons = tuple(s for s in all_seasons if lo <= s <= hi)
+    # Series rows only exist for playoff games -- back to player-seasons
+    # when the table switches to the regular season.
+    units = [u for u in ROW_UNITS if u != "series" or season_type == "playoffs"]
+    _restore_league_widget("lg_unit", "player")
+    if st.session_state["lg_unit"] not in units:
+        st.session_state["lg_unit"] = "season"
+    unit = cols[2].radio(
+        "Rows", units, key="lg_unit", format_func={
+            "player": "Player", "season": "Season", "series": "Series",
+        }.get,
+        help="**Player**: each player's games across the seasons picked, in one row. **Season**: "
+             "one row per player-season. **Series** (playoffs): one row per playoff series a player "
+             "played in. A gold row won the title: a player-season of a champion, or a series in a "
+             "title run (a Player row only when the table is one season).",
+    )
+
+    gp_key = f"lg_min_gp_{season_type}"
+    _restore_league_widget(gp_key, 10 if season_type == "regular" else 1)
+    _restore_league_widget("lg_min_mpg", 0.0)
+    _restore_league_widget("lg_search", "")
+    row_cols = st.columns([1, 1, 2, 3])
+    min_games = row_cols[0].number_input(
+        "Min games", min_value=0, step=1, key=gp_key,
+        help="Leave out rows with fewer games (counted after the game filter) -- otherwise a "
+             "one-game 1.000 TS% tops every rate column.",
+    )
+    min_minutes = row_cols[1].number_input("Min MIN/G", min_value=0.0, step=1.0, key="lg_min_mpg")
+    search = row_cols[2].text_input("Find player", key="lg_search", placeholder="Type a name…")
+    _remember_league_widgets("lg_season_type", "lg_unit", gp_key, "lg_min_mpg", "lg_search")
+    saved[range_key] = (lo, hi)
+
+    render_game_filters({league}, directory, False, LEAGUE_FILTER_INTRO)
+    game_filter = current_game_filter()
+
+    formulas = {f["label"]: f["expr"] for f in st.session_state.custom_formulas}
+
+    def mark_slow(label: str) -> str:
+        return f"{label}  ⏱" if any(family_is_slow(f) for f in families_for([label], formulas)) else label
+
+    stat_labels = render_stat_picker(
+        "League", format_stat=mark_slow,
+        picker_note="⏱ = slow to compute for a whole league. A table that would take more than a "
+                    f"few seconds holds those back until you ask for them.",
+    )
+    if not stat_labels:
+        st.caption("No stats selected — pick some above.")
+        return
+
+    query = LeagueQuery(league, seasons, season_type, unit, game_filter, int(min_games), float(min_minutes))
+    with st.spinner(f"Gathering every {league} player's games…"):
+        rows = get_league_rows(query)
+    if not len(rows):
+        st.info("No players left -- loosen the minimums or the game filter.")
+        return
+
+    # Families already computed for these rows cost nothing; plan() holds
+    # back the expensive rest when they'd make the table slow.
+    needed = families_for(stat_labels, formulas)
+    cache = get_league_family_cache()
+    done = {f for f in needed if (query, f) in cache}
+    run_now, held, held_seconds = plan(rows, needed, done)
+    if held and st.session_state.get("_lg_confirmed") == (query, frozenset(held)):
+        run_now, held = run_now | held, set()
+
+    parts = {}
+    to_compute = sorted(run_now, key=lambda f: estimate_seconds([f], len(rows), rows.player_seasons))
+    bar = st.progress(0.0) if to_compute else None
+    for i, family in enumerate(to_compute):
+        text = f"Computing {FAMILY_NAMES[family]} for {len(rows):,} rows…"
+        bar.progress(i / len(to_compute), text=text)
+        parts[family] = league_family_values(
+            rows, family, lambda frac, i=i, text=text: bar.progress((i + frac) / len(to_compute), text=text),
+        )
+    if bar is not None:
+        bar.empty()
+    for family in done:
+        parts[family] = league_family_values(rows, family)
+
+    if held:
+        held_stats = [label for label in stat_labels if families_for([label], formulas) & held]
+        with st.container(border=True):
+            st.warning(
+                f"**Not loaded yet:** {', '.join(held_stats)} -- they need "
+                f"{', '.join(FAMILY_NAMES[f] for f in sorted(held))}, about **{held_seconds:.0f} s** "
+                f"for {len(rows):,} rows. Their columns are blank until loaded; everything else is ready."
+            )
+            st.button(
+                f"Load them (~{held_seconds:.0f} s)", type="primary",
+                on_click=_confirm_league_families, args=(query, frozenset(held)),
+            )
+
+    # Series logs only exist in the playoffs and seeds only in the regular
+    # season -- blank by definition here, so say where they are instead.
+    other_type = {f for f in needed if f in ("depth", "avg_seed") and not family_applies(f, query)}
+    if other_type:
+        other = "playoffs" if season_type == "regular" else "regular"
+        st.caption(
+            f"{', '.join(l for l in stat_labels if families_for([l], formulas) & other_type)} "
+            f"only exist for {SEASON_TYPE_NAMES[other].lower()} games -- switch **Games** to "
+            f"{SEASON_TYPE_NAMES[other]} to fill them in."
+        )
+
+    table = build_league_table(rows, parts, stat_labels, formulas).reset_index(drop=True)
+    stat_cols = [c for c in table.columns if c not in rows.info.columns]
+
+    teams = sorted({t for cell in table["Team"] for t in cell.split("/") if t})
+    picked_teams = row_cols[3].multiselect("Teams", teams, key=f"lg_teams_{league}", placeholder="Every team")
+    shown = table
+    if search:
+        shown = shown[shown["Player"].str.contains(search, case=False, na=False, regex=False)]
+    if picked_teams:
+        shown = shown[shown["Team"].map(lambda cell: bool(set(cell.split("/")) & set(picked_teams)))]
+
+    formats, lower_is_better = formats_and_lower_is_better(combined_stat_defs)
+    sort_col = ("PTS/G" if "PTS/G" in stat_cols else stat_cols[0]) if stat_cols else None
+    if sort_col:
+        shown = shown.sort_values(sort_col, ascending=sort_col in lower_is_better, na_position="last")
+
+    what = f"{SEASON_TYPE_NAMES[season_type].lower()}, " + (
+        season_str(seasons[0], league) if len(seasons) == 1
+        else f"{season_str(seasons[0], league)} to {season_str(seasons[-1], league)}"
+        + (", seasons combined" if unit == "player" else "")
+    )
+    noun = {"player": "players", "season": "player-seasons", "series": "player-series"}[unit]
+    count = f"{len(shown):,} of {len(rows):,} {noun}" if len(shown) != len(rows) else f"{len(rows):,} {noun}"
+    titles = int(shown["Champion"].sum())
+    st.caption(f"**{count}** · {what} · min {int(min_games)} GP" + (
+        f", {min_minutes:g} MIN/G" if min_minutes else "") + (
+        f" · :orange-background[gold] = won the title ({titles:,} rows)" if titles else ""))
+    if unit == "series":
+        st.caption(
+            "Each row is one series: %ile is blank (it ranks whole seasons), and Win Shares and the "
+            "series columns count only that series' games."
+        )
+    if game_filter.is_active:
+        note = (
+            " %ile rows show — while game conditions are on, since they rank whole seasons."
+            if query.narrowed else ""
+        )
+        st.info(
+            "**Game filter on** — " + " · ".join(game_filter.describe())
+            + f"  \nKept {rows.games_kept:,} of {rows.games_total:,} games." + note
+        )
+
+    render_league_grid(
+        shown, stat_cols, formats, sort_col, descending=sort_col not in lower_is_better,
+        height=min(42 * (len(shown) + 1) + 10, 740),
+    )
+    render_stat_notes(stat_labels)
+    st.caption(
+        "The estimated / partial-coverage footnote marks aren't shown here -- add the player under "
+        "*Compare players* to see which of their numbers carry one."
+    )
+
+
+if app_mode == "League":
+    render_league_view()
+    st.stop()
 
 # ---------- span builder ----------
 
@@ -869,125 +1623,12 @@ if head_to_head:
                 for me, opp in ((a, b), (b, a))
             ]
 
-with st.expander("Game filters", expanded=False):
-    st.caption(
-        "Only count games that pass **every** condition below -- for all rows, regular season "
-        "and playoffs alike. Opponent W% and seed are the opponent's regular-season record "
-        "that season. In head-to-head, conditions are read from the first row's side "
-        "(a \"W\" is a game it won), and player conditions like MIN must hold for both rows."
-    )
-    if "gf_on" not in st.session_state:
-        st.session_state.gf_on = True
-    st.toggle("Apply game filters", key="gf_on",
-              help="Switch off to see the unfiltered numbers without losing the filters set up here.")
+render_game_filters(
+    {s.league for s in valid_spans} or (set(data_config.LEAGUES) if league_mode == "Both" else {league_mode}),
+    directory, league_mode == "Both", INDIVIDUAL_FILTER_INTRO,
+)
 
-    st.markdown("**Season qualifiers**")
-    st.caption(
-        "Keep or drop **whole seasons**, judged on the full regular season before any game "
-        "filter below (a duo: the games they shared). A dropped season loses its playoff games "
-        "too. Only availability and role are offered -- a cutoff on production like PTS/G would "
-        "guarantee the very number being compared."
-    )
-    render_quick_buttons(QUICK_SEASON_FILTERS, "season", per_row=3)
-    render_condition_rows("season", "+ Add season qualifier")
-
-    st.divider()
-    st.markdown("**Game conditions**")
-    st.caption("Quick add:")
-    render_quick_buttons(QUICK_FILTERS, "game")
-    render_condition_rows("game", "+ Add condition")
-
-    st.divider()
-    cat_cols = st.columns(3)
-    cat_cols[0].radio("Location", LOCATIONS, key="gf_location", horizontal=True)
-    cat_cols[1].radio("Result", RESULTS, key="gf_result", horizontal=True)
-    cat_cols[2].radio("Game length", GAME_LENGTHS, key="gf_length", horizontal=True)
-
-    opp_cols = st.columns([2, 1, 4])
-    opp_cols[0].radio(
-        "Opponent conference", OPP_CONFERENCES, key="gf_opp_conf", horizontal=True,
-        format_func=lambda c: {"Same": "Own conf.", "Other": "Other conf."}.get(c, c),
-        help="Uses today's conference alignment for every season (realignments like Milwaukee "
-             "moving East in 1980 aren't modeled), and teams from before the conference table's "
-             "coverage fail East/West.",
-    )
-    opp_cols[1].radio("Opponents", OPPONENT_MODES, key="gf_opp_mode",
-                      format_func=lambda m: "Only vs." if m == "Only" else "Exclude")
-    filter_leagues = {s.league for s in valid_spans} or (
-        set(data_config.LEAGUES) if league_mode == "Both" else {league_mode}
-    )
-    opp_options = sorted(
-        {abbr for lg in filter_leagues for abbr in get_team_abbreviations(lg)}
-        | set(st.session_state.get("gf_opponents", []))
-    )
-    opp_cols[2].multiselect(
-        "Teams", opp_options, key="gf_opponents", placeholder="Any opponent",
-        help="Abbreviations as they appeared at the time -- a relocated franchise is listed "
-             "under each of its names (e.g. SEA and OKC), so pick all you mean.",
-    )
-
-    st.divider()
-    st.markdown("**Opponent players & season finish**")
-    st.caption(
-        "Like head-to-head, but for any number of rows: only games where the players picked here "
-        "were on the **other** team with 10+ minutes. *Season finish* is how far a team went in "
-        "that season's playoffs, counted back from the Finals like the rounds below (*Last 4* = "
-        "the conference finals in a 4-round NBA year) and cumulative (*Made last 4* includes the "
-        "Finalists) -- so \"opponent won title\" also keeps regular-season games against the "
-        "eventual champion."
-    )
-    # Picker keys are "LEAGUE:ID", since the two leagues' ids are separate
-    # lists. A player picked under another league setting stays selected,
-    # named from gf_vs_names.
-    vs_names = dict(zip(directory.LEAGUE + ":" + directory.PLAYER_ID.astype(str), directory.PLAYER_NAME))
-    vs_names |= {k: v for k, v in st.session_state.get("gf_vs_names", {}).items() if k not in vs_names}
-    vs_options = list(vs_names)
-    vs_cols = st.columns([1, 4])
-    vs_cols[0].radio(
-        "Match", VS_PLAYER_MODES, key="gf_vs_mode",
-        format_func={"Any": "vs. any of", "All": "vs. all of", "None": "vs. none of"}.get,
-        help="*All of* keeps games where every player picked was on the other team at once.",
-    )
-    vs_cols[1].multiselect(
-        "Opponent players", vs_options, key="gf_vs_players", placeholder="Type a name…",
-        format_func=lambda k: f"{vs_names[k]} ({k.split(':')[0]})" if league_mode == "Both" else vs_names[k],
-    )
-    st.session_state.gf_vs_names = {k: vs_names[k] for k in st.session_state.get("gf_vs_players", [])}
-    fin_cols = st.columns(2)
-    fin_cols[0].selectbox(
-        "Opponent's season", list(SEASON_FINISHES), key="gf_opp_finish", format_func=SEASON_FINISHES.get,
-        help="Only games against teams that went this far that season.",
-    )
-    fin_cols[1].selectbox(
-        "Own team's season", list(SEASON_FINISHES), key="gf_team_finish", format_func=SEASON_FINISHES.get,
-        help="Only games for a team (this row's team) that went this far that season -- e.g. a "
-             "player's title runs.",
-    )
-
-    st.divider()
-    st.markdown("**Playoff games**")
-    st.caption(
-        "These only narrow **playoff** games -- the regular-season table is untouched. Rounds count "
-        "back from the Finals, so *Last 4* is the conference finals in a 4-round NBA year and the "
-        "semifinals in the WNBA. A *closeout* game is one a win would clinch, an *elimination* game "
-        "one a loss would end; a Game 7 is both (*winner-take-all*). Series length is read off the "
-        "result (a 4-2 series was best-of-7)."
-    )
-    po_cols = st.columns([2, 1, 2])
-    po_cols[0].multiselect(
-        "Round", list(PLAYOFF_ROUNDS), key="gf_po_rounds", format_func=PLAYOFF_ROUNDS.get,
-        placeholder="Every round",
-    )
-    po_cols[1].radio("Series home court", SERIES_HOME_COURT, key="gf_po_home",
-                     help="Whether this row's team had home-court advantage in the series "
-                          "(hosted Game 1) -- not whether this game was at home; that's Location above.")
-    po_cols[2].radio("Series situation", SERIES_SITUATIONS, key="gf_po_situation", horizontal=True)
-    st.caption("Quick add -- each one adds a playoffs-only row under Game conditions above:")
-    render_quick_buttons(QUICK_PLAYOFF_FILTERS, "game", per_row=3)
-
-    st.button("Clear all filters", on_click=set_game_filter_state, args=(GameFilter(),))
-
-game_filter = game_filter_from_state() if st.session_state.get("gf_on", True) else GameFilter()
+game_filter = current_game_filter()
 
 if len(valid_spans) > 1:
     current_labels = [s.label for s in valid_spans]
@@ -1013,141 +1654,10 @@ st.divider()
 
 
 
-def _all_presets() -> list[dict]:
-    return BUILTIN_PRESETS + st.session_state.user_presets
-
-
-def _on_preset_pick():
-    name = st.session_state.get("preset_pick")
-    preset = next((p for p in _all_presets() if p["name"] == name), None)
-    if preset is None:
-        return  # clicking the active preset again just deselects it -- nothing to change
-    formulas, order = apply_preset(preset, st.session_state.custom_formulas)
-    st.session_state.custom_formulas = formulas
-    st.session_state.stat_order = order
-    st.session_state.selected_stats = list(order)
-
-
-def _save_user_preset():
-    name = st.session_state.get("new_preset_name", "").strip()
-    if not name:
-        st.session_state["_preset_msg"] = ("error", "Give the preset a name.")
-    elif name in BUILTIN_PRESET_NAMES:
-        st.session_state["_preset_msg"] = ("error", f"'{name}' is a built-in preset — pick a different name.")
-    elif not st.session_state.stat_order:
-        st.session_state["_preset_msg"] = ("error", "Pick some stats to save first.")
-    else:
-        preset = preset_from_current(name, st.session_state.stat_order, st.session_state.custom_formulas)
-        others = [p for p in st.session_state.user_presets if p["name"] != name]
-        replaced = len(others) != len(st.session_state.user_presets)
-        err = set_user_presets(others + [preset])
-        st.session_state.new_preset_name = ""
-        st.session_state["_preset_msg"] = ("error", err) if err else (
-            "success", f"{'Updated' if replaced else 'Saved'} preset '{name}'.",
-        )
-
-
-def _delete_user_preset(name: str):
-    err = set_user_presets([p for p in st.session_state.user_presets if p["name"] != name])
-    if err:
-        st.session_state["_preset_msg"] = ("error", err)
-
-
-def _import_presets_file():
-    upload = st.session_state.get("preset_import")
-    if upload is None:
-        return
-    try:
-        imported, dropped = presets_from_json(upload.getvalue())
-    except ValueError as e:
-        st.session_state["_preset_msg"] = ("error", str(e))
-        return
-    err = set_user_presets(restore_user_presets(st.session_state.user_presets + imported)[0])
-    msg = f"Imported {len(imported)} preset(s)" + (f": {', '.join(p['name'] for p in imported)}." if imported else ".")
-    if dropped:
-        msg += f" Dropped (no stats left, or named like a built-in): {', '.join(dropped)}."
-    st.session_state["_preset_msg"] = ("error", err) if err else ("success", msg)
-
-
 if len(valid_spans) == 0:
     st.info("Add at least one player above to see a comparison.")
 else:
-    # Reflect which preset (if any) the current rows match, so the pill
-    # shows as active until the stats are edited by hand. Set before the
-    # widget renders, which is the only point Streamlit allows it.
-    presets = _all_presets()
-    st.session_state.preset_pick = matching_preset(st.session_state.stat_order, presets)
-    st.pills(
-        "Stat presets", [p["name"] for p in presets], selection_mode="single",
-        key="preset_pick", on_change=_on_preset_pick,
-        help="Swap the table to a themed set of stats. Presets add the custom formulas they "
-             "need and remove them again when you switch; your own formulas are never touched.",
-    )
-
-    with st.expander("Customize stats shown", expanded=False):
-        available_labels = list(combined_stat_defs.keys())
-
-        if "selected_stats" not in st.session_state:
-            st.session_state.selected_stats = [s for s in st.session_state.stat_order if s in available_labels]
-
-        selected = st.multiselect(
-            "Stats to show (box score, usage, team, consistency, and your custom stats)",
-            options=available_labels,
-            key="selected_stats",
-        )
-
-        # Keep stat_order in sync with the current selection (add newly
-        # picked stats at the end, drop deselected ones) before reordering.
-        ordered_selection = [s for s in st.session_state.stat_order if s in selected]
-        ordered_selection += [s for s in selected if s not in ordered_selection]
-        st.session_state.stat_order = ordered_selection
-
-        st.caption("Drag to reorder:")
-        if ordered_selection:
-            # Key depends on WHICH stats are selected (not their order), so
-            # the component only remounts -- and re-syncs to the correct
-            # item list -- when you add/remove a stat, not on every drag.
-            sorter_key = "stat_order_sorter_" + "|".join(sorted(ordered_selection))
-            new_order = sort_items(ordered_selection, key=sorter_key)
-            # Defensive: only trust the component's output if it's actually
-            # a reordering of what we gave it. A stale response (e.g. the
-            # frontend hasn't caught up with a selection change yet) would
-            # otherwise get written into stat_order and corrupt every
-            # future run, since nothing else resets it.
-            if new_order and set(new_order) == set(ordered_selection):
-                st.session_state.stat_order = new_order
-            else:
-                st.session_state.stat_order = ordered_selection
-        stat_labels = st.session_state.stat_order
-
-        st.divider()
-        preset_cols = st.columns([3, 1])
-        preset_cols[0].text_input(
-            "Save these stats as a preset", key="new_preset_name", placeholder="Preset name",
-            help="Saves the stats above, in this order, plus any custom formulas they use. "
-                 f"Saving under an existing name updates it. Presets are saved to "
-                 f"{user_presets_path()} and come back after a refresh; they're also kept in your save code.",
-        )
-        preset_cols[1].button("Save preset", on_click=_save_user_preset, use_container_width=True)
-        msg = st.session_state.pop("_preset_msg", None)
-        if msg:
-            {"error": st.error, "warning": st.warning}.get(msg[0], st.success)(msg[1])
-        for p in st.session_state.user_presets:
-            cols = st.columns([4, 1])
-            cols[0].caption(f"**{p['name']}** — {len(p['stats'])} stats")
-            cols[1].button("✕", key=f"del_user_preset_{p['name']}",
-                           on_click=_delete_user_preset, args=(p["name"],))
-        io_cols = st.columns(2)
-        io_cols[0].download_button(
-            "Export presets", data=presets_to_json(st.session_state.user_presets),
-            file_name="nba_compare_presets.json", mime="application/json",
-            disabled=not st.session_state.user_presets, use_container_width=True,
-            help="Download your presets as a file, to back them up or move them to another machine.",
-        )
-        io_cols[1].file_uploader(
-            "Import presets", type=["json"], key="preset_import", on_change=_import_presets_file,
-            help="Add presets from an exported file. One with the same name as a saved preset replaces it.",
-        )
+    stat_labels = render_stat_picker("Individual")
 
     result = compare_spans(valid_spans, stores, game_filter)
     if game_filter.is_active:
@@ -1202,82 +1712,10 @@ else:
                                        lower_is_better=lower_is_better, flags=po_flags),
                 unsafe_allow_html=True,
             )
-        if any(lbl.endswith("/100") or lbl == "Poss/G" for lbl in stat_labels):
-            st.caption(
-                "**/100** = per 100 team possessions the player was on the floor for, using that "
-                "team's own measured pace over these exact games — the pace-aware counterpart to "
-                "/36, which can't tell a 100-possession game from an 85-possession one. Possessions "
-                "come out of the team box score, so these rows are blank for NBA seasons before 1977: "
-                "turnovers weren't recorded, and without them there's no possession estimate to make."
-            )
-        if any(lbl.endswith("/75") for lbl in stat_labels):
-            st.caption(
-                "**/75** = the /100 rate scaled to 75 possessions — the same pace adjustment, "
-                "at roughly a starter's per-game possession count, which is the usual baseline "
-                "for comparing players across eras."
-            )
-        if any(lbl.startswith(("Team ", "Opp ")) and lbl.endswith("/G") and lbl not in ("Team Poss/G",)
-               for lbl in stat_labels):
-            st.caption(
-                "**Team/Opp …/G** = the player's team's and its opponents' box score, per game, over "
-                "the games in this span. Each is averaged over the games that have it recorded; "
-                "before 1985 (NBA) most columns are rebuilt from player logs where possible, as are "
-                "WNBA team turnovers in 1997, 2000 and 2003 (footnoted)."
-            )
-        if any(lbl.startswith("Lg ") for lbl in stat_labels):
-            st.caption(
-                "**Lg …** = the league-average team's box score per game (and pace, TS%), over the whole "
-                "league for this span's seasons, weighted by the span's games in each season. Never "
-                "narrowed by game filters, and not highlighted -- it's context, mostly for formulas."
-            )
-        if any(lbl.endswith(("(P25)", "(P75)")) for lbl in stat_labels):
-            st.caption(
-                "**(P25)/(P75)** = the 25th and 75th percentile of the game log: half of the span's "
-                "games fall between them."
-            )
-        if any(lbl in ("OWS", "DWS", "WS", "WS/48") for lbl in stat_labels):
-            st.caption(
-                "**Win Shares** = Basketball-Reference's method: credit for team wins split into "
-                "offense (OWS, from Dean Oliver's points produced) and defense (DWS, from his "
-                "individual defensive rating), against that season's league averages. A plain "
-                "season or career uses the team's full-season totals, as Basketball-Reference does; "
-                "a filtered span, head-to-head or duo uses only its own games, so it's the wins "
-                "earned in those games. A duo's is the two players' own Win Shares added. WS/48 is "
-                "per 48 minutes in the WNBA too (Basketball-Reference shows WS/40 there). Blank for "
-                "NBA seasons before 1977-78, which have no player turnovers."
-            )
-        if len({s.league for s in valid_spans}) > 1:
-            st.caption(
-                "**NBA and WNBA side by side**: each row is measured against its own league -- %ile "
-                "and relative shooting rank a WNBA season among WNBA players, and pace counts "
-                "possessions per 48 minutes in the NBA but per 40 in the WNBA. Raw counting stats "
-                "are straight comparisons, but WNBA games are 8 minutes shorter, so per-game "
-                "numbers favor the NBA; /36 and /100 even that out."
-            )
-        if any(lbl.endswith("CV%") for lbl in stat_labels):
-            st.caption(
-                "CV% = game-to-game standard deviation \u00f7 mean, as a percent. Lower means more "
-                "predictable output game to game; it isn't a judgment of good or bad for a given role."
-            )
-        if head_to_head and all(s.vs_player_ids for s in valid_spans):
-            st.caption(
-                "**Head-to-head**: only games where every player in both rows logged 10+ minutes, "
-                "with the two rows on opposite teams, within the seasons both rows cover -- so both "
-                "columns come from the same games, and W/L is the head-to-head record. A duo's "
-                "column is the two players' combined numbers, as in Duo mode, and only counts games "
-                "where both of them played. %ile rows show — here, since they rank whole seasons "
-                "and don't describe these games. The playoff series breakdown lists only the "
-                "series they met in."
-            )
-        if any(lbl.endswith("%ile") for lbl in stat_labels):
-            st.caption(
-                "%ile = where this stat ranks among qualifying players **in that same season and league** "
-                "(min. 10 games regular season, 1 game playoffs) -- 90 means better than ~90% of the "
-                "league that year. A span covering multiple seasons shows a games-weighted average "
-                "across those seasons. Turnovers are inverted so higher %ile always means better, "
-                "same as every other stat here. Duo spans show — for %ile rows -- percentiles "
-                "rank against individual players, so a combined duo total isn't a meaningful comparison."
-            )
+        render_stat_notes(
+            stat_labels, mixed_leagues=len({s.league for s in valid_spans}) > 1,
+            head_to_head=head_to_head and all(s.vs_player_ids for s in valid_spans),
+        )
 
     if has_playoffs:
         st.markdown("<br>", unsafe_allow_html=True)

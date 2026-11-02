@@ -177,6 +177,39 @@ for _label, _key in _LEAGUE_KEYS.items():
     )
 NEUTRAL_PREFIX = "Lg "
 
+# Which part of the stat block each row reads -- its "family". League mode
+# (league.py) computes one family at a time for every player, only the
+# families the chosen rows need, and prices each one so a slow family is
+# asked for rather than run by accident. Every STAT_DEFS row must be listed
+# (checked below): a row filed under the wrong family would come out blank
+# in the league table.
+STAT_FAMILY = {
+    **{label: "box" for label in (
+        "GP", "W", "L", "MIN/G", "+/-", "+/- Std Dev", "TSA/G", "Team W%",
+        "FG%", "3P%", "FT%", "eFG%", "TS%",
+        *(f"{name}/G" for name in _BOX_LABELS.values()),
+    )},
+    **{label: "per_100" for label in STAT_DEFS if label.endswith("/100")},
+    "Poss/G": "per_100",
+    **{label: "usage" for label in ("MIN%", "USG%", "USG Vol/G")},
+    **{label: "relative_shooting" for label in ("rFG%", "r3P%", "rFT%", "reFG%", "rTS%")},
+    **{label: "win_shares" for label in ("OWS", "DWS", "WS/48")},
+    **{label: "team" for label in ("Team Poss/G", "Team Pace", "Team ORtg", "Team DRtg", "Net Rtg", "Team MOV")},
+    "Avg Seed (approx)": "avg_seed",
+    **{label: "consistency" for label in STAT_DEFS
+       if label.endswith(("(P10)", "(P25)", "(P75)", "CV%"))},
+    **{label: "depth" for label in (
+        "Championships", "Finals Apps", "Series W", "Series L", "Best Round Reached",
+        "Playoff Seasons", "Series Missed (Injury)",
+    )},
+    **{label: "percentiles" for label in STAT_DEFS if label.endswith(" %ile")},
+    **{label: "team_box" for label in _TEAM_BOX_KEYS},
+    **{label: "league" for label in _LEAGUE_KEYS},
+}
+_unfiled = set(STAT_DEFS) ^ set(STAT_FAMILY)
+if _unfiled:
+    raise ValueError(f"STAT_FAMILY and STAT_DEFS disagree on: {sorted(_unfiled)}")
+
 # Shown by default; advanced/team/consistency rows are opt-in since they
 # answer a different question than raw production and would clutter the
 # default view.
@@ -244,15 +277,32 @@ PARTIAL_NOTE = (
 )
 PARTIAL_WS = "partial_ws"
 PARTIAL_WS_NOTE = (
-    "Win Shares need player turnovers, which the NBA only recorded from 1977-78, so for a "
-    "span reaching earlier they count only the games from then on:"
+    "Win Shares need a game's full box line -- player turnovers (recorded from 1977-78), the "
+    "offensive/defensive rebound split and steals, and complete team lines, all patchy before the "
+    "mid-1980s -- so they count only the games that have one. WS/48 is left blank when those "
+    "games are under half the span's minutes, since it would describe a sliver of the span:"
 )
-FOOTNOTES = {ESTIMATED: ESTIMATED_NOTE, PARTIAL: PARTIAL_NOTE, PARTIAL_WS: PARTIAL_WS_NOTE}
+PARTIAL_BOX = "partial_box"
+PARTIAL_BOX_NOTE = (
+    "Not recorded in every game: the game logs before the 1970s leave minutes, shot attempts, "
+    "rebounds or assists blank for some games (most minutes before the mid-1960s), so this is "
+    "averaged over only the games that have it -- a rate like FG% over the games with both its "
+    "makes and attempts. Basketball-Reference's season pages use the official season totals "
+    "instead, so expect small differences:"
+)
+FOOTNOTES = {
+    ESTIMATED: ESTIMATED_NOTE, PARTIAL: PARTIAL_NOTE, PARTIAL_WS: PARTIAL_WS_NOTE, PARTIAL_BOX: PARTIAL_BOX_NOTE,
+}
 
 # Small and faint, so a footnote number beside a stat reads as a marker and
 # not an exponent (the browser default is ~83% size, full strength); line-
 # height 0 keeps a marked cell from growing taller than its row.
 FOOTNOTE_MARK_STYLE = "font-size:.6em;opacity:.55;margin-left:2px;line-height:0;"
+
+def _box_coverage(key: str):
+    """Getter for (games recording `key`, games) -- see compare._box_block."""
+    return lambda b: (b["coverage"][key], b["games"]) if b.get("coverage") else None
+
 
 def _ws_coverage(block: dict) -> tuple[int, int] | None:
     ws = block.get("win_shares")
@@ -267,6 +317,11 @@ PARTIAL_SOURCES = {
     "OWS": (PARTIAL_WS, _ws_coverage),
     "DWS": (PARTIAL_WS, _ws_coverage),
     "WS/48": (PARTIAL_WS, _ws_coverage),
+    **{label: (PARTIAL_BOX, _box_coverage(key)) for label, key in (
+        ("MIN/G", "MIN"), ("TSA/G", "TSA"),
+        ("FG%", "FG_PCT"), ("3P%", "FG3_PCT"), ("FT%", "FT_PCT"), ("eFG%", "EFG_PCT"), ("TS%", "TS_PCT"),
+        *((f"{name}/G", stat) for stat, name in _BOX_LABELS.items()),
+    )},
 }
 
 
@@ -283,6 +338,20 @@ def _partial_coverage(block: dict | None, label: str) -> tuple[str, int, int] | 
         return None
     recorded, games = coverage
     return (kind, recorded, games) if 0 < recorded < games else None
+
+
+def value_sample(block: dict | None, label: str) -> tuple[int, float | None] | None:
+    """(games, minutes -- None when unknown) this row's value rests on, when
+    that's only SOME of the span's games (see _partial_coverage), else None.
+    What lets a league table hold a value to its minimums on its own games:
+    Win Shares over 2 of a row's 15 games, 5 minutes, isn't a 4-game,
+    20-minute sample just because the row is."""
+    partial = _partial_coverage(block, label)
+    if partial is None:
+        return None
+    kind, recorded, _games = partial
+    minutes = (block.get("win_shares") or {}).get("minutes") if kind == PARTIAL_WS else None
+    return recorded, minutes
 
 
 def _cell_mark(block: dict | None, label: str) -> tuple[str, str | None] | None:

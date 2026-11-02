@@ -31,6 +31,7 @@ See its docstring for exactly what it doesn't account for.
 from __future__ import annotations
 import pandas as pd
 from .data import NBADataStore
+from . import box as _box
 from .models import season_str
 
 STANDARD_ROUND_LABELS = {1: "First Round", 2: "Conf Semis", 3: "Conf Finals", 4: "Finals"}
@@ -183,15 +184,25 @@ def _league_rounds(season_team_games: pd.DataFrame) -> pd.DataFrame:
     return games
 
 
+def season_rounds(store: NBADataStore, season: int) -> pd.DataFrame:
+    """_league_rounds for one postseason, cached on the store -- every
+    series lookup for every player that season reads the same bracket, and
+    rebuilding it per lookup is most of what a playoff series log costs.
+    Shared: callers must not modify it."""
+    cache_key = f"league_rounds_{season}"
+    if cache_key not in store._cache:
+        store._cache[cache_key] = _league_rounds(store.team_games_for_season(season, "playoffs"))
+    return store._cache[cache_key]
+
+
 def team_series_structure(store: NBADataStore, team_id: int, season: int) -> pd.DataFrame:
     """The TEAM's full round-by-round series structure that postseason,
     from team-level game logs -- the authoritative source for round
     numbers/opponents/results, since a team's own log doesn't have gaps
     the way one player's log can when they miss games to injury."""
-    team_games = store.team_games_for_season(season, "playoffs")
-    if not (team_games["TEAM_ID"] == team_id).any():
+    league = season_rounds(store, season)
+    if not (league["TEAM_ID"] == team_id).any():
         return pd.DataFrame()
-    league = _league_rounds(team_games)
     return league[league["TEAM_ID"] == team_id]
 
 
@@ -237,11 +248,14 @@ def identify_series_for_player(store: NBADataStore, player_games: pd.DataFrame) 
     return out
 
 
+_SERIES_STATS = ["PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
+
+
 def _empty_series_stat_block() -> dict:
     """Placeholder stats for a series the player didn't appear in at all
     (missed to injury) -- GP=0, everything else None/0 rather than
     omitted, so SERIES_COLUMN_DEFS getters don't need special-casing."""
-    stat_cols = ["PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
+    stat_cols = _SERIES_STATS
     return {
         "gp": 0,
         "per_game": {c: None for c in stat_cols},
@@ -283,7 +297,7 @@ def playoff_game_context(store: NBADataStore, season: int) -> pd.DataFrame:
         store._cache[cache_key] = pd.DataFrame(columns=cols)
         return store._cache[cache_key]
 
-    games = _league_rounds(team_games).sort_values("GAME_DATE", kind="stable")
+    games = season_rounds(store, season).sort_values("GAME_DATE", kind="stable")
     series = games.groupby(["TEAM_ID", "SERIES_ID"], sort=False)
     win = (games["WL"] == "W").astype(int)
     loss = (games["WL"] == "L").astype(int)
@@ -316,17 +330,22 @@ def league_round_depth(store: NBADataStore, season: int) -> pd.DataFrame:
     season's true deepest round and champion without assuming a fixed
     4-round structure.
     """
-    team_games = store.team_games_for_season(season, "playoffs")
-    if team_games.empty:
-        return pd.DataFrame(columns=["TEAM_ID", "rounds_played", "won_final_series"])
+    cache_key = f"round_depth_{season}"
+    if cache_key in store._cache:
+        return store._cache[cache_key]
+    games = season_rounds(store, season)
+    if games.empty:
+        store._cache[cache_key] = pd.DataFrame(columns=["TEAM_ID", "rounds_played", "won_final_series"])
+        return store._cache[cache_key]
 
     rows = []
-    for team_id, g in _league_rounds(team_games).groupby("TEAM_ID"):
+    for team_id, g in games.groupby("TEAM_ID"):
         max_round = int(g["ROUND"].max())
         final = g[g["ROUND"] == max_round]
         wins, losses = int((final["WL"] == "W").sum()), int((final["WL"] == "L").sum())
         rows.append({"TEAM_ID": team_id, "rounds_played": max_round, "won_final_series": wins > losses})
-    return pd.DataFrame(rows)
+    store._cache[cache_key] = pd.DataFrame(rows)
+    return store._cache[cache_key]
 
 
 def season_playoff_finish(store: NBADataStore, season: int) -> pd.DataFrame:
@@ -348,7 +367,7 @@ def season_playoff_finish(store: NBADataStore, season: int) -> pd.DataFrame:
         store._cache[cache_key] = pd.DataFrame(columns=cols)
         return store._cache[cache_key]
 
-    games = _league_rounds(team_games)
+    games = season_rounds(store, season)
     deepest = int(games["ROUND"].max())
     last = games[games["ROUND"] == games.groupby("TEAM_ID")["ROUND"].transform("max")]
     out = (
@@ -378,21 +397,22 @@ def season_champion_team_id(store: NBADataStore, season: int) -> int | None:
 
 def _series_stat_block(g: pd.DataFrame) -> dict:
     """Per-series box score numbers -- same shape of calc as compare.py's
-    _stat_block, but series-scoped and without team/usage context (not
-    meaningful at single-series granularity)."""
-    gp = len(g)
-    stat_cols = ["PTS", "REB", "OREB", "DREB", "AST", "STL", "BLK", "TOV", "PF", "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA"]
-    totals = {c: g[c].sum() for c in stat_cols if c in g.columns}
-    per_game = {c: (totals[c] / gp if gp else None) for c in totals}
-    fga, fgm, fg3m, fta, ftm = (totals.get(k, 0) for k in ("FGA", "FGM", "FG3M", "FTA", "FTM"))
-    shooting = {
-        "FG_PCT": fgm / fga if fga else None,
-        "FG3_PCT": totals.get("FG3M", 0) / totals["FG3A"] if totals.get("FG3A") else None,
-        "FT_PCT": ftm / fta if fta else None,
-        "EFG_PCT": (fgm + 0.5 * fg3m) / fga if fga else None,
-        "TS_PCT": totals.get("PTS", 0) / (2 * (fga + 0.44 * fta)) if (fga or fta) else None,
+    _stat_block (each average over the games that recorded it, each rate
+    over the games with all its parts -- see box.py), but series-scoped and
+    without team/usage context (not meaningful at single-series
+    granularity). "box" keeps the raw sums so series can be combined
+    exactly (aggregate_series_group)."""
+    return _stats_from_box(len(g), _box.box_sums(g))
+
+
+def _stats_from_box(gp: int, b: dict) -> dict:
+    return {
+        "gp": gp,
+        "per_game": _box.per_game(b, _SERIES_STATS),
+        "shooting": _box.shooting(b),
+        "totals": {c: b["sums"][c] for c in _SERIES_STATS},
+        "box": b,
     }
-    return {"gp": gp, "per_game": per_game, "shooting": shooting, "totals": totals}
 
 
 def aggregate_series_group(records: list[dict]) -> dict | None:
@@ -412,24 +432,14 @@ def aggregate_series_group(records: list[dict]) -> dict | None:
     """
     if not records:
         return None
-    combined_totals: dict[str, float] = {}
-    for r in records:
-        for k, v in r["stats"]["totals"].items():
-            combined_totals[k] = combined_totals.get(k, 0) + v
+    played = [r["stats"]["box"] for r in records if "box" in r["stats"]]
     gp = sum(r["stats"]["gp"] for r in records)
-    per_game = {k: (v / gp if gp else None) for k, v in combined_totals.items()}
-    fga, fgm, fg3m, fta, ftm = (combined_totals.get(k, 0) for k in ("FGA", "FGM", "FG3M", "FTA", "FTM"))
-    shooting = {
-        "FG_PCT": fgm / fga if fga else None,
-        "FG3_PCT": combined_totals.get("FG3M", 0) / combined_totals["FG3A"] if combined_totals.get("FG3A") else None,
-        "FT_PCT": ftm / fta if fta else None,
-        "EFG_PCT": (fgm + 0.5 * fg3m) / fga if fga else None,
-        "TS_PCT": combined_totals.get("PTS", 0) / (2 * (fga + 0.44 * fta)) if (fga or fta) else None,
-    }
+    stats = _stats_from_box(gp, _box.merge_box_sums(played)) if played else _empty_series_stat_block()
+    stats["gp"] = gp
     return {
         "w": sum(r["w"] for r in records),
         "l": sum(r["l"] for r in records),
-        "stats": {"gp": gp, "per_game": per_game, "shooting": shooting, "totals": combined_totals},
+        "stats": stats,
         "series_count": len(records),
     }
 

@@ -5,7 +5,9 @@ single seasons, or custom ranges — including regular season and playoff
 stats, usage, per-possession rates, team context, and game-to-game
 consistency, side by side. Rows can be single players or teammate duos,
 restricted to the games two sides played against each other, and drawn
-from either league or both at once.
+from either league or both at once. A second view, the **league table**,
+lists every player in a league for a season or range of seasons, one
+sortable row each, with the same stats, formulas and filters.
 
 The core idea: the unit being compared is a **span** (one player + one set
 of seasons), not a "player." That's what lets you compare two different
@@ -88,6 +90,9 @@ only needed if the dataset is ever made private.
 streamlit run app.py
 ```
 
+- **View** at the top: **Compare players** (everything below) or **League
+  table** — every player in one league, one row each, sortable by any stat.
+  See "League table" below. Switching back and forth keeps both views' setup.
 - **League picker** (NBA / WNBA / Both) at the top — which league's players
   the search covers. **Both** lets an NBA and a WNBA player share a table;
   see "NBA, WNBA, or both" above.
@@ -161,8 +166,8 @@ python smoke_test.py
 ```
 
 Prints the data source it resolved, then confirms the files load,
-`SEASON_ID` parsing works on real data, and the comparison + chart pipeline
-runs end to end.
+`SEASON_ID` parsing works on real data, and the comparison, league table
+and chart pipelines run end to end.
 
 ## Folder layout
 
@@ -176,12 +181,14 @@ nba_compare/                        <- project root, cd here to work
     │   ├── models.py                PlayerSpan, DuoSpan
     │   ├── data.py                  NBADataStore -- loads/joins parquet
     │   ├── compare.py               stat computation + N-way comparison
+    │   ├── box.py                   box-score sums that skip unrecorded games
     │   ├── table.py                 Stathead-style table + stat catalog
     │   ├── presets.py               built-in stat presets + their formulas
     │   ├── playoffs.py              series/round/championship identification
     │   ├── percentiles.py           league percentile ranks per season
     │   ├── formulas.py              safe evaluator for custom formulas
     │   ├── filters.py               optional game filters (close games, vs. top seeds, ...)
+    │   ├── league.py                league table: every player's row, priced per stat family
     │   ├── session_config.py        save/load format for app setups
     │   ├── players.py               player search helper for the UI
     │   ├── accolades.py             awards data model -- groundwork, not in the app yet
@@ -206,7 +213,7 @@ toggleable/reorderable in the app; the • ones are on by default.
 In the rendered table, a small superscript number on a value points to a
 numbered footnote under that table. Numbers are assigned per table in the
 order the caveats appear, and only the footnotes a table uses are shown.
-There are two kinds:
+The kinds:
 
 - **Rebuilt team data**: the value comes from team box scores rebuilt out
   of player rows. See "Per 100 possessions" below.
@@ -215,6 +222,45 @@ There are two kinds:
   averaged over only the later games. The footnote gives each span's count,
   e.g. Jordan's career is 306 of 1,072. A span with none recorded shows `—`
   instead.
+- **Partial box score** — the early game logs' gaps. See "Games with
+  unrecorded stats" below.
+
+### Games with unrecorded stats
+
+The game logs before the 1970s are full of holes: minutes for most games
+before the mid-1960s (and none at all before 1951-52), field goal attempts,
+rebounds and assists for some, and the offensive/defensive rebound split,
+steals, blocks and turnovers for part of 1977-82. A missing value is
+*unrecorded*, not zero, so:
+
+- **Every average is over the games that recorded it.** Elgin Baylor's
+  1961-62 has minutes for 11 of his 48 games: MIN/G is 43.7 over those 11
+  (Basketball-Reference: 44.4), not 10.0 over all 48. That also kept his
+  PTS/36 over 100; it's now 31.5. Larry Bird's 1979-86 ORB/G and DRB/G
+  (rebound split missing in 183 of 561 games) now add up to his TRB/G
+  instead of falling three short.
+- **Every rate uses only games with all its parts.** FG% is FGM over FGA
+  from the games with both, never makes from 48 games over attempts from 37;
+  TS% needs PTS, FGA and FTA. Per-36 is the stat's per-game average over the
+  minutes' (the Per 36 preset's own formula), each over the games that have it.
+- **The value is footnoted** with the games it rests on ("11 of 48 games"),
+  our version of Basketball-Reference underlining an incomplete total.
+  Their season pages come from the official season totals, which cover every
+  game, so an average over a subset can differ slightly (Baylor's AST/G is
+  5.6 over the 19 games that recorded assists; officially 4.6).
+- **A stat with no games recorded is `—`**, not 0 — steals before 1973-74,
+  for example — and so is its percentile.
+
+Minutes need one extra step: the logs store unrecorded minutes as `0`, not
+blank. On load, a `0` becomes blank wherever that team's player minutes for
+the game don't add up to a full game (`data._blank_unrecorded_minutes`); a
+modern player in for a few seconds still logs a real 0. The same rule covers
+percentiles, league averages, per-100, usage, playoff series breakdowns and
+game filters: a game whose minutes weren't recorded fails a `MIN ≥ 30`
+condition rather than passing `MIN ≤ 20`, and a season qualifier's MIN/G is
+over the games with minutes. Duo and head-to-head mode still need both
+players' minutes (10+ each), so they can't count a game whose minutes went
+unrecorded.
 
 **Box score** — •GP, •W, •L, •MIN/G, •PTS/G, •TRB/G, ORB/G, DRB/G, •AST/G, •STL/G,
 •BLK/G, •TOV/G, •PF/G, •+/-
@@ -597,6 +643,91 @@ added up.
 - **Both players must be from the same league** — a cross-league pair
   shows "Different leagues -- never teammates" in Both mode.
 
+## League table
+
+Switch **View** to **League table** for a season stats page: one row per
+player, one column per stat, for every player in the league — click a
+column header to sort (again to flip it). The **Rk** column numbers rows by
+their position in the current sort, so it renumbers with every click, and
+blank cells (a stat not recorded) always sort to the bottom. The table is an
+AG Grid (`streamlit-aggrid`) rather than `st.dataframe` for exactly that:
+`st.dataframe` sorts in the browser without telling the app the order, so a
+rank column there would stay attached to its rows instead of renumbering.
+
+- **One league at a time.** Every league-wide number (percentiles, league
+  averages, standings) is per league, and NBA and WNBA rows in one sortable
+  column would need their numbers put on one scale first.
+- **Seasons**: one season by default; widen the slider for a range.
+- **Rows**: **Player** combines each player's seasons in the range into one
+  row (their totals and averages over it); **Season** is one row per
+  player-season; **Series** (playoffs only) is one row per playoff series a
+  player played in, with its Round, Opp and result (`W 4-2`) — each series
+  stands on its own, so it sorts, filters and ranks like any other row. In
+  a series row %ile is blank (it ranks whole seasons), and Win Shares and
+  the series stats count only that series' games.
+- **Gold rows won the title**: a player-season of a champion, or a series in
+  a title run (a Player row only when the table is a single season). "Won"
+  is the same as the Championships stat: appearing in the champion's
+  postseason.
+- **Regular season or playoffs**, one at a time. Playoff series rows
+  (Championships, Series W, ...) only fill in on the playoffs table, and Avg
+  Seed only on the regular season one — the app says so when one is picked.
+- **Min games / Min MIN/G** leave out rows below them, counted after the
+  game filter — 10 games by default for the regular season and 1 for the
+  playoffs, so a one-game 1.000 TS% doesn't top every rate column. A value
+  built from only **some** of a row's games — Win Shares or a box-score
+  stat where the old logs have gaps, plus-minus before it was recorded —
+  has to meet them on its own games, or it's blank: a 15-game, 27.7-MIN/G
+  row whose Win Shares rest on 2 games and 5 minutes doesn't get to rank
+  them as a 4-game, 20-minute sample. (Minutes are checked where they're
+  known; for a box-score gap they usually aren't, so it's games only.)
+  **Find player** and **Teams** narrow the rows shown (a traded player's
+  Team reads like `BKN/PHX`).
+- **Same stats, presets, formulas and game filters** as the comparison —
+  literally the same widgets, so a stat set or filter set up in one view is
+  there in the other. Season qualifiers keep or drop each player's seasons
+  one at a time; game conditions apply to every player's games.
+- **Same numbers.** Every row is built by the same code as a span in the
+  comparison: a player's row equals what Compare players shows for that
+  player and seasons, stat for stat (checked across every built-in, both
+  leagues, both season types, and with filters on). The only thing missing
+  is the footnote marks (estimated / partial coverage) — add the player to
+  the comparison to see which of their numbers carry one.
+
+### Why some stats are marked ⏱
+
+A league table is hundreds or thousands of rows, so it isn't built the way
+a comparison column is. Each stat belongs to a **family** — the part of the
+stat block it reads (`table.STAT_FAMILY`: box score, usage, per 100, team
+ratings, team/opp box score, consistency, Win Shares, percentiles, playoff
+series, ...) — and the table computes only the families its stats need, one
+at a time for every row. A custom formula needs whatever its stats need.
+
+Each family has a measured cost (`league.FAMILY_COST_MS`, per row plus per
+player-season). One NBA season is about 500 rows, ten seasons split by year
+about 4,800, and in round numbers:
+
+| family | one season | ten seasons, row per season |
+|---|---|---|
+| box score, shooting, usage, per 100, relative shooting, league averages, percentiles | under 0.5 s each | 1–4 s each |
+| ⏱ team ratings, team/opp box, consistency, Win Shares | 0.8–1.5 s each | 8–15 s each |
+| ⏱ playoff series (playoffs only, ~230 rows a season) | under 1 s | about 6 s |
+
+The ⏱ families are marked in the stat picker. When the stats picked would
+take more than about 5 seconds (`league.WARN_SECONDS`), the most expensive ⏱
+families are **held back**: the table shows straight away with those columns
+blank, and a **Load them (~N s)** button computes them. Cheap families are
+never held — a big table may take a few seconds, but never shows up missing
+its basic columns. Anything computed is cached, so sorting, searching or
+re-picking stats afterwards is instant.
+
+The costs are timings, so they go stale when a family's code changes —
+rerun the measurement and paste its output over `FAMILY_COST_MS`:
+
+```bash
+python -m nba_compare.league
+```
+
 ## Head-to-head
 
 Turn on **Head-to-head** with exactly two rows (each a player or a duo) and
@@ -878,6 +1009,18 @@ viz.grouped_bar(result, stats=["PTS", "AST", "REB"], season_type="regular").show
 viz.radar(result, stats=["PTS", "AST", "REB", "STL", "BLK"]).show()
 ```
 
+The league table works the same way outside the app:
+
+```python
+from nba_compare.league import LeagueQuery, league_rows, family_values, families_for, build_league_table
+
+stats = ["GP", "MIN/G", "PTS/G", "TS%", "USG%", "OWS", "DWS"]
+rows = league_rows(store, LeagueQuery("NBA", seasons=(2024,), season_type="regular",
+                                      unit="player", min_games=20))
+parts = {f: family_values(rows, f) for f in families_for(stats, formulas={})}
+build_league_table(rows, parts, stats, formulas={}).sort_values("PTS/G", ascending=False)
+```
+
 To mix leagues, give each span its `league` and pass one store per league —
 each span is then read from its own league's store:
 
@@ -922,7 +1065,8 @@ notebook/script use — `smoke_test.py` exercises this exact path.
 
 - Shooting percentages (FG%, 3P%, FT%, eFG%, TS%) are recomputed from
   summed makes/attempts across a span, not averaged from per-game
-  percentages — a 1-for-1 game shouldn't weigh the same as a 10-for-15 game.
+  percentages — a 1-for-1 game shouldn't weigh the same as a 10-for-15 game
+  — over the games with both recorded (see "Games with unrecorded stats").
 - Regular season and playoffs are always kept as separate stat blocks,
   never blended, since playoff sample sizes are much smaller and noisier.
 - Usage% is aggregated the way Basketball-Reference does it for
@@ -941,8 +1085,13 @@ notebook/script use — `smoke_test.py` exercises this exact path.
   players' own Win Shares added, not one run on the combined box line.
   NBA seasons before 1977-78 have no player turnovers and get none
   (Basketball-Reference estimates them from player age, which the data
-  doesn't have); a span reaching earlier is footnoted with the games it
-  covers. 1977-84 rest on rebuilt team lines and are marked estimated.
+  doesn't have), and into the mid-1980s some games still lack the
+  offensive/defensive rebound split, steals or a full team line; a span
+  with such games is footnoted with the games it covers. **WS/48 is blank**
+  when the covered games are under half the span's minutes
+  (`win_shares.WS_PER_48_MIN_COVERAGE`) -- otherwise a rate over a sliver
+  tops the league table: Phil Ford's playoff career came down to two
+  garbage-time games, 5 minutes, and a WS/48 of .746. 1977-84 rest on rebuilt team lines and are marked estimated.
   WS/48 is per 48 minutes in the WNBA too.
 - BPM and VORP aren't included: BPM's team adjustment needs every
   teammate's season and a strength-of-schedule team rating.

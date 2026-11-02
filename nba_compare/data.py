@@ -68,7 +68,7 @@ def _to_minutes(min_col: pd.Series) -> pd.Series:
 
     def parse(v):
         if pd.isna(v):
-            return 0.0
+            return float("nan")
         s = str(v)
         if ":" in s:
             m, sec = s.split(":")
@@ -148,6 +148,24 @@ def _fill_missing_team_stats(
     prior = out["TEAM_EST"] if "TEAM_EST" in out.columns else False
     out["TEAM_EST"] = estimated | prior
     return out.drop(columns=[key] + [f"_recon_{c}" for c in src_cols])
+
+
+def _blank_unrecorded_minutes(players: pd.DataFrame, game_minutes: float) -> pd.DataFrame:
+    """
+    The player logs store minutes that weren't recorded as 0, not blank --
+    most games before the mid-1960s, every game before 1951-52. Left as 0
+    they read as real: Elgin Baylor's 1961-62 averaged 10.0 MIN/G (37 of his
+    48 games say 0) instead of 43.7, and his per-36 numbers came out over
+    100. So a 0 becomes NaN wherever the game's roster doesn't add up to a
+    full game (5 * game_minutes, less ROSTER_MINUTES_TOLERANCE): those
+    minutes went unrecorded. A game whose minutes DO add up keeps its zeros
+    -- a modern player in for a few seconds really did log 0.
+    """
+    full_game = 5 * game_minutes - ROSTER_MINUTES_TOLERANCE
+    roster = players.groupby(["GAME_ID", "TEAM_ID"])["MIN_NUM"].transform("sum")
+    unrecorded = (players["MIN_NUM"] == 0) & (roster < full_game)
+    players.loc[unrecorded, "MIN_NUM"] = float("nan")
+    return players
 
 
 def _repair_team_lines(team: pd.DataFrame, players: pd.DataFrame, game_minutes: float) -> pd.DataFrame:
@@ -236,6 +254,8 @@ class NBADataStore:
             if callable(source):
                 source = source()
             df = _prep(pd.read_parquet(source))
+            if not key.startswith("team_"):
+                df = _blank_unrecorded_minutes(df, self.game_minutes)
             if key.startswith("team_") and self.league in REPAIR_TEAM_MINUTES_LEAGUES:
                 players = self._load(key.removeprefix("team_"))
                 df = _repair_team_lines(df, players, self.game_minutes)
@@ -376,9 +396,23 @@ class NBADataStore:
         stats can be flagged as estimates rather than passed off as
         officially sourced.
         """
-        player_df = self.games(player_id, seasons, season_type)
+        return self._with_team_context(self.games(player_id, seasons, season_type), season_type)
+
+    def league_games_with_team_context(self, seasons: list[int], season_type: str) -> pd.DataFrame:
+        """games_with_team_context() for EVERY player's games in these
+        seasons at once -- one join instead of one per player, which is
+        what makes a league-wide table affordable (see league.py)."""
+        df = self._load(season_type)
+        return self._with_team_context(df[df.SEASON.isin(seasons)], season_type)
+
+    def _with_team_context(self, player_df: pd.DataFrame, season_type: str) -> pd.DataFrame:
+        """The join behind games_with_team_context(), for any set of player
+        rows -- one player's or a whole league's."""
         team_key = "team_regular" if season_type == "regular" else "team_playoffs"
         team_df = self._load(team_key)
+        # Only these games' team lines can match -- narrowing first keeps a
+        # league-wide join from dragging every other season through it.
+        team_df = team_df[team_df["GAME_ID"].isin(player_df["GAME_ID"].unique())]
 
         team_slim = team_df[["GAME_ID", "TEAM_ID", "MIN_NUM"] + TEAM_BOX_STATS].rename(
             columns={"MIN_NUM": "TEAM_MIN", **{c: f"TEAM_{c}" for c in TEAM_BOX_STATS}}
@@ -394,9 +428,10 @@ class NBADataStore:
         # Join on GAME_ID only (opponent has a different TEAM_ID by definition),
         # then keep just the row where the matched team ISN'T the player's own
         # team -- assumes exactly 2 teams per GAME_ID in the team parquet.
+        # Deduped per player, since a league-wide frame has many per game.
         merged = merged.merge(opp_slim, on="GAME_ID", how="left")
         merged = merged[(merged["OPP_TEAM_ID"].isna()) | (merged["OPP_TEAM_ID"] != merged["TEAM_ID"])]
-        merged = merged.drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
+        merged = merged.drop_duplicates(subset=["GAME_ID", "PLAYER_ID"], keep="first").reset_index(drop=True)
 
         recon = self._reconstructed_team_lines(season_type)
         merged = _fill_missing_team_stats(merged, recon, "TEAM", "TEAM_ID")
@@ -543,6 +578,10 @@ class NBADataStore:
             games = self.games_together(side[0], side[1], seasons, season_type, min_minutes)
         ids = self.head_to_head_game_ids(side, opponents, seasons, season_type, min_minutes)
         return games[games["GAME_ID"].isin(ids)].reset_index(drop=True)
+
+    def seasons(self, season_type: str = "regular") -> list[int]:
+        """Every season the logs cover, oldest first."""
+        return sorted(self._load(season_type)["SEASON"].unique().tolist())
 
     def seasons_played(self, player_id: int, season_type: str = "regular") -> list[int]:
         df = self._load(season_type)

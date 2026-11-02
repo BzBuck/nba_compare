@@ -6,7 +6,7 @@ Run from the project root (the folder this file lives in):
 
 Confirms: the parquet files resolve via config.py (by default fetched from
 the Hugging Face dataset and cached locally), SEASON_ID parsing works on the
-real data, and the comparison + viz pipeline runs end to end.
+real data, and the comparison, league table and viz pipelines run end to end.
 """
 from nba_compare import PlayerSpan, NBADataStore, compare_spans, viz, config
 
@@ -44,7 +44,17 @@ print(result.summary().to_string(index=False))
 print("\n--- per-game, regular season ---")
 print(result.wide_table("regular", "per_game").round(2))
 
-# 4. Confirm figures build and open one in the browser.
+# 4. Confirm the league table builds: every player that season, one row each.
+from nba_compare.league import LeagueQuery, league_rows, family_values, families_for, build_league_table
+
+stats = ["GP", "PTS/G", "TS%", "USG%"]
+rows = league_rows(store, LeagueQuery("NBA", (seasons[-1],), "regular", "player", min_games=10))
+parts = {f: family_values(rows, f) for f in families_for(stats, {})}
+league_table = build_league_table(rows, parts, stats, {}).sort_values("PTS/G", ascending=False)
+print(f"\n--- league table, {len(league_table)} players (top 5 by PTS/G) ---")
+print(league_table.head(5).round(3).to_string(index=False))
+
+# 5. Confirm figures build and open one in the browser.
 fig = viz.grouped_bar(result, stats=["PTS", "AST", "REB", "STL", "TOV"], season_type="regular")
 fig.show()
 

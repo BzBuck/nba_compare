@@ -21,6 +21,7 @@ from __future__ import annotations
 from functools import lru_cache
 import pandas as pd
 from .data import NBADataStore
+from . import box as _box
 from .models import PlayerSpan
 
 # Stat -> whether a HIGHER raw value is better. Only TOV runs the other way.
@@ -56,35 +57,21 @@ def season_league_table(
     if games.empty:
         return pd.DataFrame()
 
-    grouped = games.groupby("PLAYER_ID").agg(
-        GP=("PTS", "size"),
-        PTS=("PTS", "sum"), REB=("REB", "sum"), AST=("AST", "sum"),
-        STL=("STL", "sum"), BLK=("BLK", "sum"), TOV=("TOV", "sum"),
-        FGM=("FGM", "sum"), FGA=("FGA", "sum"),
-        FG3M=("FG3M", "sum"), FG3A=("FG3A", "sum"),
-        FTM=("FTM", "sum"), FTA=("FTA", "sum"),
-    ).reset_index()
-
-    qualified = grouped[grouped["GP"] >= min_games].copy()
+    # Each per-game value over the games that recorded it, each rate over the
+    # games with all its parts -- see box.py. A stat nobody recorded that
+    # season (steals before 1973) comes out blank, and so does its %ile.
+    by_player = games.groupby("PLAYER_ID")
+    gp = by_player.size()
+    qualified = gp.index[gp >= min_games]
     if qualified.empty:
         return pd.DataFrame()
 
-    gp = qualified["GP"]
-    per_game = pd.DataFrame({
-        "PLAYER_ID": qualified["PLAYER_ID"],
-        "GP": gp,
-        "PTS": qualified["PTS"] / gp,
-        "REB": qualified["REB"] / gp,
-        "AST": qualified["AST"] / gp,
-        "STL": qualified["STL"] / gp,
-        "BLK": qualified["BLK"] / gp,
-        "TOV": qualified["TOV"] / gp,
-        "FG_PCT": qualified["FGM"] / qualified["FGA"].replace(0, pd.NA),
-        "FG3_PCT": qualified["FG3M"] / qualified["FG3A"].replace(0, pd.NA),
-        "FT_PCT": qualified["FTM"] / qualified["FTA"].replace(0, pd.NA),
-        "EFG_PCT": (qualified["FGM"] + 0.5 * qualified["FG3M"]) / qualified["FGA"].replace(0, pd.NA),
-        "TS_PCT": qualified["PTS"] / (2 * (qualified["FGA"] + 0.44 * qualified["FTA"])).replace(0, pd.NA),
-    })
+    counting = ["PTS", "REB", "AST", "STL", "BLK", "TOV"]
+    per_game = (by_player[counting].sum(min_count=1) / by_player[counting].count()).loc[qualified]
+    rates = _box.shooting_frame(games, games["PLAYER_ID"]).loc[qualified]
+    per_game = pd.concat([per_game, rates], axis=1).astype(float)
+    per_game.insert(0, "GP", gp.loc[qualified])
+    per_game = per_game.rename_axis("PLAYER_ID").reset_index()
 
     for stat, higher_is_better in PERCENTILE_STATS.items():
         direction = 1 if higher_is_better else -1
@@ -121,14 +108,14 @@ def span_percentiles(store: NBADataStore, span: PlayerSpan, season_type: str = "
         for season in span.seasons
     ]
     per_season = [p for p in per_season if p is not None]
-    if not per_season:
-        return {stat: None for stat in PERCENTILE_STATS}
-
-    total_gp = sum(p["gp"] for p in per_season)
-    return {
-        stat: sum(p[stat] * p["gp"] for p in per_season) / total_gp if total_gp else None
-        for stat in PERCENTILE_STATS
-    }
+    result = {}
+    for stat in PERCENTILE_STATS:
+        # A season where the stat wasn't recorded has no rank for it -- left
+        # out of this stat's average, like a season the player didn't qualify.
+        ranked = [p for p in per_season if pd.notna(p[stat])]
+        total_gp = sum(p["gp"] for p in ranked)
+        result[stat] = sum(p[stat] * p["gp"] for p in ranked) / total_gp if total_gp else None
+    return result
 
 
 @lru_cache(maxsize=64)
@@ -145,17 +132,8 @@ def league_average_rates(store: NBADataStore, season: int, season_type: str = "r
     games = store.all_player_games_for_season(season, season_type)
     if games.empty:
         return {}
-    fgm, fga = games["FGM"].sum(), games["FGA"].sum()
-    fg3m, fg3a = games["FG3M"].sum(), games["FG3A"].sum()
-    ftm, fta = games["FTM"].sum(), games["FTA"].sum()
-    pts = games["PTS"].sum()
-    return {
-        "FG_PCT": fgm / fga if fga else None,
-        "FG3_PCT": fg3m / fg3a if fg3a else None,
-        "FT_PCT": ftm / fta if fta else None,
-        "EFG_PCT": (fgm + 0.5 * fg3m) / fga if fga else None,
-        "TS_PCT": pts / (2 * (fga + 0.44 * fta)) if (fga or fta) else None,
-    }
+    # Each rate over the player-games with all its parts recorded (box.py).
+    return _box.shooting(_box.box_sums(games))
 
 
 def span_league_average(

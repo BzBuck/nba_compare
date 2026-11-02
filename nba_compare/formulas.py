@@ -92,6 +92,15 @@ def _tokenize_stat_labels(expr: str, variables: dict) -> tuple[str, dict]:
     return pattern.sub(_replace, expr), placeholder_values
 
 
+def referenced_labels(expr: str, labels) -> set[str]:
+    """The stat labels (out of `labels`) that expr actually uses, matched the
+    same longest-first way safe_eval reads them -- so "TS% %ile" counts as
+    that one stat, not as TS%. What league.py uses to work out which stat
+    families a custom formula needs computed."""
+    _, matched = _tokenize_stat_labels(expr, {label: label for label in labels})
+    return set(matched.values())
+
+
 def safe_eval(expr: str, variables: dict):
     """
     Evaluates expr using only the given variables, keyed by stat label

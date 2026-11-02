@@ -42,6 +42,22 @@ TEAM_COLS = ["TEAM_MIN"] + [f"TEAM_{c}" for c in BOX_COLS]
 OPP_COLS = [f"OPP_{c}" for c in BOX_COLS]
 
 
+# WS/48 is only given when the games Win Shares could be computed for hold
+# at least this share of the span's recorded minutes. Before the mid-1980s
+# many games lack something Win Shares needs (the offensive/defensive rebound
+# split, steals, turnovers, a full team line), and a rate over what's left
+# can describe a sliver of the span: Phil Ford's 15 playoff games came down
+# to two garbage-time ones, 5 minutes, and a WS/48 of .746. OWS and DWS stay,
+# as the Win Shares earned in the games covered.
+WS_PER_48_MIN_COVERAGE = 0.5
+
+
+def _ws_per_48(ows: float, dws: float, covered_minutes: float, recorded_minutes: float) -> float | None:
+    if not covered_minutes or covered_minutes < WS_PER_48_MIN_COVERAGE * recorded_minutes:
+        return None
+    return 48 * (ows + dws) / covered_minutes
+
+
 def _possessions(t: dict, o: dict) -> float:
     """Basketball-Reference's team possession estimate, averaged over both
     sides -- the one its pace, league ORtg and team DRtg are built on (and
@@ -59,7 +75,8 @@ def _any_estimated(rows: pd.DataFrame) -> bool:
 
 
 def _sums(rows: pd.DataFrame, prefix: str = "") -> dict:
-    return {c: rows[f"{prefix}{c}"].sum() for c in BOX_COLS}
+    totals = rows[[f"{prefix}{c}" for c in BOX_COLS]].sum().to_numpy()
+    return dict(zip(BOX_COLS, totals))
 
 
 def _fill_pre_three(games: pd.DataFrame) -> pd.DataFrame:
@@ -99,10 +116,20 @@ def _group_win_shares(p: dict, t: dict, o: dict, mp: float, team_mp: float, opp_
     player's, t the team's, o the opponent's. Variable names follow
     Basketball-Reference's write-up so each line can be checked against it."""
     # -- Offense: points produced and individual possessions ---------------
+    # The share of teammates' baskets that were assisted while he was on the
+    # floor -- a proportion, but as written it breaks down over a few minutes:
+    # make 3 of 3 in a 3-minute stint and the expected teammate makes go
+    # negative, which turned 6 points into 29.9 produced. Over a season that
+    # never happens; when it does here, the team's assisted share of everyone
+    # else's makes stands in, and the share is kept within 0-1.
+    teammate_fgm_on_floor = (t["FGM"] / team_mp) * mp * 5 - p["FGM"]
+    if teammate_fgm_on_floor > 0:
+        assisted_share = ((t["AST"] / team_mp) * mp * 5 - p["AST"]) / teammate_fgm_on_floor
+    else:
+        assisted_share = (t["AST"] - p["AST"]) / (t["FGM"] - p["FGM"])
+    assisted_share = min(max(assisted_share, 0.0), 1.0)
     q_ast = ((mp / (team_mp / 5)) * (1.14 * ((t["AST"] - p["AST"]) / t["FGM"]))
-             + ((((t["AST"] / team_mp) * mp * 5 - p["AST"])
-                 / ((t["FGM"] / team_mp) * mp * 5 - p["FGM"]))
-                * (1 - (mp / (team_mp / 5)))))
+             + assisted_share * (1 - (mp / (team_mp / 5))))
     shot_share = 0.5 * ((p["PTS"] - p["FTM"]) / (2 * p["FGA"])) * q_ast if p["FGA"] else 0.0
     fg_part = p["FGM"] * (1 - shot_share)
     team_two_pt_rate = ((t["PTS"] - t["FTM"]) - (p["PTS"] - p["FTM"])) / (2 * (t["FGA"] - p["FGA"]))
@@ -166,6 +193,24 @@ def _with_full_lines(rows: pd.DataFrame) -> pd.DataFrame:
     return rows[rows["TEAM_MIN"] > 0]
 
 
+@lru_cache(maxsize=256)
+def _season_team_contexts(store: NBADataStore, season: int, season_type: str) -> dict:
+    """
+    {TEAM_ID: (team totals, opponent totals, team minutes, opponent minutes,
+    estimated)} over each team's whole season of this type -- the context
+    full_team_seasons uses. Every player on a team shares it, so it's summed
+    once per season here rather than once per player (which, for a
+    league-wide table, was most of what Win Shares cost).
+    """
+    games = _with_full_lines(_fill_pre_three(store.team_games_with_opponents(season, season_type)))
+    out = {}
+    for team_id, context in games.groupby("TEAM_ID"):
+        team_mp = context["TEAM_MIN"].sum()
+        opp_mp = context["OPP_MIN"].where(context["OPP_MIN"] > 0, context["TEAM_MIN"]).sum()
+        out[team_id] = (_sums(context, "TEAM_"), _sums(context, "OPP_"), team_mp, opp_mp, _any_estimated(context))
+    return out
+
+
 def _player_view(games: pd.DataFrame, prefix: str) -> pd.DataFrame:
     """One half of a duo's combined rows as if they were that player's own:
     their A_*/B_* box columns (see NBADataStore.games_together) moved into
@@ -180,7 +225,7 @@ def compute_win_shares(
     games: pd.DataFrame, store: NBADataStore, season_type: str, full_team_seasons: bool = False,
 ) -> dict | None:
     """
-    {"ows", "dws", "ws_per_48", "minutes", "covered_games", "games",
+    {"ows", "dws", "ws_per_48", "minutes", "recorded_minutes", "covered_games", "games",
     "estimated"} for a span's games, or None when not one of them can carry
     Win Shares.
 
@@ -216,16 +261,18 @@ def compute_win_shares(
             return None
         a, b = halves
         minutes = a["minutes"] + b["minutes"]
+        recorded = a["recorded_minutes"] + b["recorded_minutes"]
         ows, dws = a["ows"] + b["ows"], a["dws"] + b["dws"]
         return {
-            "ows": ows, "dws": dws, "minutes": minutes,
-            "ws_per_48": 48 * (ows + dws) / minutes if minutes else None,
+            "ows": ows, "dws": dws, "minutes": minutes, "recorded_minutes": recorded,
+            "ws_per_48": _ws_per_48(ows, dws, minutes, recorded),
             "covered_games": min(a["covered_games"], b["covered_games"]),
             "games": len(games),
             "estimated": a["estimated"] or b["estimated"],
         }
 
     games = _fill_pre_three(games)
+    recorded_minutes = games["MIN_NUM"].sum()
     ows = dws = covered_minutes = 0.0
     covered_games, estimated = 0, False
     for (season, team_id), group in games.groupby(["SEASON", "TEAM_ID"]):
@@ -236,17 +283,17 @@ def compute_win_shares(
         if lg is None or valid.empty or not mp:
             continue
         if full_team_seasons:
-            team_games = _fill_pre_three(store.team_games_with_opponents(int(season), season_type))
-            context = _with_full_lines(team_games[team_games["TEAM_ID"] == team_id])
+            context = _season_team_contexts(store, int(season), season_type).get(team_id)
+            if context is None:
+                continue
+            t, o, team_mp, opp_mp, context_estimated = context
         else:
-            context = valid
-        team_mp = context["TEAM_MIN"].sum()
-        opp_mp = context["OPP_MIN"].where(context["OPP_MIN"] > 0, context["TEAM_MIN"]).sum()
+            t, o = _sums(valid, "TEAM_"), _sums(valid, "OPP_")
+            team_mp = valid["TEAM_MIN"].sum()
+            opp_mp = valid["OPP_MIN"].where(valid["OPP_MIN"] > 0, valid["TEAM_MIN"]).sum()
+            context_estimated = _any_estimated(valid)
         try:
-            ws = _group_win_shares(
-                _sums(valid), _sums(context, "TEAM_"), _sums(context, "OPP_"),
-                mp, team_mp, opp_mp, lg, store.game_minutes,
-            )
+            ws = _group_win_shares(_sums(valid), t, o, mp, team_mp, opp_mp, lg, store.game_minutes)
         except ZeroDivisionError:
             continue
         # Scale a partly covered group up to all the player's minutes in it.
@@ -256,14 +303,15 @@ def compute_win_shares(
         dws += ws["dws"] * scale
         covered_minutes += group_minutes
         covered_games += len(playable)
-        estimated |= scale > 1.0001 or _any_estimated(valid) or _any_estimated(context)
+        estimated |= scale > 1.0001 or _any_estimated(valid) or context_estimated
     if not covered_games:
         return None
     return {
         "ows": ows, "dws": dws, "minutes": covered_minutes,
+        "recorded_minutes": recorded_minutes,
         # Per 48 minutes in both leagues, so NBA and WNBA rows read on one
         # scale (Basketball-Reference's WNBA pages use WS/40 instead).
-        "ws_per_48": 48 * (ows + dws) / covered_minutes if covered_minutes else None,
+        "ws_per_48": _ws_per_48(ows, dws, covered_minutes, recorded_minutes),
         "covered_games": covered_games,
         "games": len(games),
         "estimated": estimated,
