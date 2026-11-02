@@ -96,6 +96,9 @@ PRESET_FORMULAS: dict[str, dict] = {
     "TOV%": _f("100 * TOV/G / (FGA/G + 0.44 * FTA/G + TOV/G)", lower=True),
     # 3P% on the same footing as eFG%: a made three is worth 1.5 made twos.
     "e3P%": _f("3P% * 1.5", "{:.3f}"),
+    # League-average true shooting over the span's seasons, from the
+    # league's team box score (see table._LEAGUE_KEYS).
+    "Lg TS%": _f("Lg PTS/G / (2 * (Lg FGA/G + 0.44 * Lg FTA/G))", "{:.3f}"),
     # Points scored beyond one per true shot attempt.
     "PANTS": _f("PTS/G - TSA/G"),
     # Basketball-Reference advanced percentages -- the player's share of
@@ -131,7 +134,7 @@ _PRESET_STATS: dict[str, list[str]] = {
         "PTS %ile", "TRB %ile", "AST %ile", "TS% %ile",
     ],
     "Efficiency": [
-        "TS%", "eFG%", "FG%", "2P%", "3P%", "e3P%", "FT%", "rTS%", "reFG%",
+        "TS%", "eFG%", "FG%", "2P%", "3P%", "e3P%", "FT%", "rTS%", "reFG%", "Lg TS%",
         "TSA/G", "USG%", "2PA/G", "3PA/G", "FTA/G", "3PAr", "FTr",
         "2P PTS Share", "3P PTS Share", "FT PTS Share", "AST/TOV", "TOV%",
     ],
@@ -144,7 +147,7 @@ _PRESET_STATS: dict[str, list[str]] = {
         "GP", "W", "L", "Team W%", "Team MOV", "Team ORtg", "Team DRtg", "Net Rtg",
         "Team Pace", "Team PTS/G", "Opp PTS/G", "+/-", "MIN%", "Avg Seed (approx)",
     ],
-    "Playoff résumé": [
+    "Playoff resume": [
         "GP", "Championships", "Finals Apps", "Series W", "Series L",
         "Best Round Reached", "Playoff Seasons", "Series Missed (Injury)",
     ],

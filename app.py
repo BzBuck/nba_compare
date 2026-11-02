@@ -1224,6 +1224,17 @@ else:
                 "before 1985 (NBA) most columns are rebuilt from player logs where possible, as are "
                 "WNBA team turnovers in 1997, 2000 and 2003 (footnoted)."
             )
+        if any(lbl.startswith("Lg ") for lbl in stat_labels):
+            st.caption(
+                "**Lg …** = the league-average team's box score per game (and pace, TS%), over the whole "
+                "league for this span's seasons, weighted by the span's games in each season. Never "
+                "narrowed by game filters, and not highlighted -- it's context, mostly for formulas."
+            )
+        if any(lbl.endswith(("(P25)", "(P75)")) for lbl in stat_labels):
+            st.caption(
+                "**(P25)/(P75)** = the 25th and 75th percentile of the game log: half of the span's "
+                "games fall between them."
+            )
         if any(lbl in ("OWS", "DWS", "WS", "WS/48") for lbl in stat_labels):
             st.caption(
                 "**Win Shares** = Basketball-Reference's method: credit for team wins split into "

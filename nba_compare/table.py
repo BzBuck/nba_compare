@@ -88,6 +88,20 @@ STAT_DEFS = {
     "STL Floor (P10)": (lambda b: b["consistency"]["STL"]["floor"],     "{:.1f}", False),
     "BLK Floor (P10)": (lambda b: b["consistency"]["BLK"]["floor"],     "{:.1f}", False),
     "TS% Floor (P10)": (lambda b: b["consistency"]["TS_PCT"]["floor"],  "{:.3f}", False),
+    "MIN (P25)":  (lambda b: b["consistency"]["MIN"]["p25"],            "{:.1f}", False),
+    "PTS (P25)":  (lambda b: b["consistency"]["PTS"]["p25"],            "{:.1f}", False),
+    "TRB (P25)":  (lambda b: b["consistency"]["REB"]["p25"],            "{:.1f}", False),
+    "AST (P25)":  (lambda b: b["consistency"]["AST"]["p25"],            "{:.1f}", False),
+    "STL (P25)":  (lambda b: b["consistency"]["STL"]["p25"],            "{:.1f}", False),
+    "BLK (P25)":  (lambda b: b["consistency"]["BLK"]["p25"],            "{:.1f}", False),
+    "TS% (P25)":  (lambda b: b["consistency"]["TS_PCT"]["p25"],         "{:.3f}", False),
+    "MIN (P75)":  (lambda b: b["consistency"]["MIN"]["p75"],            "{:.1f}", False),
+    "PTS (P75)":  (lambda b: b["consistency"]["PTS"]["p75"],            "{:.1f}", False),
+    "TRB (P75)":  (lambda b: b["consistency"]["REB"]["p75"],            "{:.1f}", False),
+    "AST (P75)":  (lambda b: b["consistency"]["AST"]["p75"],            "{:.1f}", False),
+    "STL (P75)":  (lambda b: b["consistency"]["STL"]["p75"],            "{:.1f}", False),
+    "BLK (P75)":  (lambda b: b["consistency"]["BLK"]["p75"],            "{:.1f}", False),
+    "TS% (P75)":  (lambda b: b["consistency"]["TS_PCT"]["p75"],         "{:.3f}", False),
     "MIN CV%":    (lambda b: b["consistency"]["MIN"]["cv_pct"],         "{:.1f}", True),
     "PTS CV%":    (lambda b: b["consistency"]["PTS"]["cv_pct"],         "{:.1f}", True),
     "TRB CV%":    (lambda b: b["consistency"]["REB"]["cv_pct"],         "{:.1f}", True),
@@ -145,6 +159,24 @@ for _label, _key in _TEAM_BOX_KEYS.items():
         "{:.1f}", _bad_for_team,
     )
 
+# League averages (compare._league_averages): the average team's box score
+# per game and pace, over the same seasons as the span and weighted by its
+# games in each. Context for formulas -- Team Pace / Lg Pace, a PER-style
+# league adjustment -- rather than something one span does better than
+# another, so these rows are never highlighted -- nor is any other "Lg "
+# row, like the Lg TS% preset formula. League shooting rates aren't
+# built-ins: Lg FGM/G / Lg FGA/G is one formula away.
+_LEAGUE_KEYS = {"Lg MIN/G": "TEAM_MIN"}
+for _stat in TEAM_BOX_STATS:
+    _LEAGUE_KEYS[f"Lg {_BOX_LABELS[_stat]}/G"] = f"TEAM_{_stat}"
+_LEAGUE_KEYS["Lg Pace"] = "PACE"
+for _label, _key in _LEAGUE_KEYS.items():
+    STAT_DEFS[_label] = (
+        lambda b, key=_key: (b.get("league") or {}).get(key),
+        "{:.1f}", False,
+    )
+NEUTRAL_PREFIX = "Lg "
+
 # Shown by default; advanced/team/consistency rows are opt-in since they
 # answer a different question than raw production and would clutter the
 # default view.
@@ -189,6 +221,7 @@ ESTIMATED_SOURCES = {
     "USG%": "usage",
     "USG Vol/G": "usage",
     **{label: ("team_box", key) for label, key in _TEAM_BOX_KEYS.items()},
+    **{label: ("league", key) for label, key in _LEAGUE_KEYS.items()},
     "Team Poss/G": "team",
     "Team Pace": "team",
     "Team ORtg": "team",
@@ -402,9 +435,10 @@ def render_stat_table_html(
         numeric = values.dropna()
         best = None
         worst = None
-        if len(numeric) > 1:
+        # League-average rows are context, not a contest -- see _LEAGUE_KEYS.
+        if len(numeric) > 1 and not row_label.startswith(NEUTRAL_PREFIX):
             best = numeric.min() if row_label in lower_is_better else numeric.max()
-        if len(numeric) >= 3:
+        if len(numeric) >= 3 and best is not None:
             worst = numeric.max() if row_label in lower_is_better else numeric.min()
             if worst == best:
                 worst = None  # all tied at the extreme -- nothing distinct to flag red

@@ -248,9 +248,21 @@ next to "AST/G") so formulas such as AST% read the way Basketball-Reference
 writes them. Each is averaged over the games that have it recorded; a column
 rebuilt from player logs gets its own rebuilt-data footnote.
 
+**League averages** — Lg MIN/G, Lg PTS/G, Lg TRB/G, Lg ORB/G, Lg DRB/G,
+Lg AST/G, Lg STL/G, Lg BLK/G, Lg TOV/G, Lg PF/G, Lg FGM/G, Lg FGA/G,
+Lg 3PM/G, Lg 3PA/G, Lg FTM/G, Lg FTA/G, Lg Pace. The average team's box
+score per game (and pace, figured the same way as Team Pace) over the whole
+league for the span's seasons, weighted by the span's games in each season —
+the same weighting as relative shooting, and never narrowed by a game filter.
+Mainly raw material for formulas (`Team Pace / Lg Pace`, league shooting as
+`Lg FGM/G / Lg FGA/G`, PER-style league adjustments), so these rows — and
+any formula row whose label starts with `Lg ` — are never highlighted
+best/worst. League TS% comes as the `Lg TS%` preset formula (in the
+Efficiency preset): `Lg PTS/G / (2 * (Lg FGA/G + 0.44 * Lg FTA/G))`.
+
 **Consistency** — MIN/PTS/TRB/AST/STL/BLK/TOV/3PM/FGM/FTM/TSA/Usage
 Vol/TS% CV% (coefficient of variation — see below), plus
-MIN/PTS/TRB/AST/STL/BLK/TS% Floor (P10)
+MIN/PTS/TRB/AST/STL/BLK/TS% Floor (P10), (P25) and (P75)
 
 **Other** — +/- Std Dev
 
@@ -282,6 +294,10 @@ The 10th percentile of the game log, not the true minimum. A single fluky
 game (early exit, garbage-time line) shouldn't define "what to expect on
 a bad night" — the floor means "about 1 game in 10 is this bad or worse,"
 which is a more realistic idea of a bad-night baseline.
+
+`(P25)` and `(P75)` are the 25th and 75th percentiles of the same game log:
+the middle half of a player's games falls between them, so P25 is a typical
+off night and P75 a typical good one.
 
 ### What "relative shooting" (rFG%, r3P%, rFT%, reFG%, rTS%) means
 
@@ -735,7 +751,7 @@ one click:
 | Totals | season-span totals (PTS, TRB, AST, … = per game × GP) |
 | Per 36 | every counting stat per 36 minutes |
 | Era-adjusted | Poss/G, Team Pace, /75 rates, relative shooting, USG%, %iles |
-| Efficiency | shooting splits, 2P%, e3P%, 3PAr, FTr, points-share by shot type, AST/TOV, TOV% |
+| Efficiency | shooting splits, 2P%, e3P%, Lg TS%, 3PAr, FTr, points-share by shot type, AST/TOV, TOV% |
 | Advanced | Basketball-Reference style PTS%/ORB%/DRB%/TRB%/AST%/STL%/BLK%/TOV%, USG%, MIN%, GmSc, PANTS, OWS/DWS/WS/WS/48 |
 | Team impact | Team W%, MOV, ORtg/DRtg/Net, Pace, Team/Opp PTS/G, +/-, MIN%, Avg Seed |
 | Playoff résumé | championships, Finals apps, series W/L, best round, missed series |

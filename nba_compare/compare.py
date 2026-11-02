@@ -5,6 +5,7 @@ N-way comparisons across spans (players, years, or mixed).
 from __future__ import annotations
 from collections.abc import Mapping
 import dataclasses
+from functools import lru_cache
 import pandas as pd
 from .data import NBADataStore, COUNTING_STATS, TEAM_BOX_STATS
 from .models import PlayerSpan, DuoSpan
@@ -294,15 +295,19 @@ def _stat_with_floor(vals: pd.Series, floor_q: float = 0.10) -> dict:
     exit, garbage-time DNP-ish line) shouldn't define "what to expect on a
     bad night." The 10th percentile means "about 1 game in 10 is this bad
     or worse," which is a much more usable idea of a realistic floor.
+
+    Also the 25th and 75th percentiles ("p25"/"p75"), the middle half of
+    the game log: a typical off night and a typical good one.
     """
     vals = vals.dropna()
     if vals.empty:
-        return {"mean": None, "std": None, "cv_pct": None, "floor": None}
+        return {"mean": None, "std": None, "cv_pct": None, "floor": None, "p25": None, "p75": None}
     mean = vals.mean()
     std = vals.std(ddof=1) if len(vals) > 1 else 0.0
     cv_pct = (std / mean * 100) if mean else None
     floor = vals.quantile(floor_q)
-    return {"mean": mean, "std": std, "cv_pct": cv_pct, "floor": floor}
+    return {"mean": mean, "std": std, "cv_pct": cv_pct, "floor": floor,
+            "p25": vals.quantile(0.25), "p75": vals.quantile(0.75)}
 
 
 def _compute_consistency(games: pd.DataFrame) -> dict:
@@ -320,7 +325,7 @@ def _compute_consistency(games: pd.DataFrame) -> dict:
     averages 12 or 30 a game. CV is not computed for stats that can be
     ~zero or swing negative (see plus_minus_std in _stat_block instead).
 
-    Each stat also gets a "floor" -- see _stat_with_floor.
+    Each stat also gets a "floor" and P25/P75 -- see _stat_with_floor.
     """
     result = {stat: _stat_with_floor(games[stat]) for stat in CONSISTENCY_STATS}
 
@@ -436,6 +441,61 @@ def _relative_shooting(store: NBADataStore, games: pd.DataFrame, shooting: dict,
     }
 
 
+@lru_cache(maxsize=128)
+def _league_season_box(store: NBADataStore, season: int, season_type: str) -> dict | None:
+    """
+    The average team's box score per game for one whole season of the
+    league ({"TEAM_PTS": ..., "TEAM_MIN": ...}), plus "PACE" -- the same
+    numbers as a span's Team rows and Team Pace, figured the same way
+    (_compute_team_box/_compute_team_context) but over every team game of
+    that season. The average opponent line is the same thing again, so
+    only the TEAM_ side is kept. "estimated" is per key, as in team_box.
+    """
+    games = store.team_games_with_opponents(season, season_type)
+    if games.empty:
+        return None
+    box = _compute_team_box(games)
+    context = _compute_team_context(games, store.game_minutes)
+    keys = ["TEAM_MIN"] + [f"TEAM_{c}" for c in TEAM_BOX_STATS]
+    result = {k: box[k] for k in keys}
+    result["PACE"] = context["team_pace"] if context else None
+    result["estimated"] = {
+        **{k: box["estimated"][k] for k in keys},
+        "PACE": bool(context and context["estimated"]),
+    }
+    return result
+
+
+def _league_averages(store: NBADataStore, games: pd.DataFrame, season_type: str) -> dict | None:
+    """
+    League-average team box score and pace across the seasons in `games`,
+    weighted by how many games THIS span has in each season -- the same
+    weighting as _relative_shooting, so a span (or a duo, or a filtered
+    span) is set against the league it actually played in. Always the
+    whole league's season, never filtered: "league average" means the
+    league. Raw material for formulas like Team Pace / Lg Pace, or a
+    PER-style league adjustment. A season missing a value is skipped for
+    that key rather than counted as zero.
+    """
+    if games.empty or "SEASON" not in games.columns:
+        return None
+    blocks = [
+        (gp, _league_season_box(store, int(season), season_type))
+        for season, gp in games.groupby("SEASON").size().items()
+    ]
+    blocks = [(gp, b) for gp, b in blocks if b is not None]
+    if not blocks:
+        return None
+    result, estimated = {}, {}
+    for key in blocks[0][1]["estimated"]:
+        used = [(gp, b) for gp, b in blocks if b[key] is not None]
+        total = sum(gp for gp, _ in used)
+        result[key] = sum(gp * b[key] for gp, b in used) / total if total else None
+        estimated[key] = any(b["estimated"][key] for _, b in used)
+    result["estimated"] = estimated
+    return result
+
+
 def _regular_season_seed(store: NBADataStore, games: pd.DataFrame) -> float | None:
     """
     Average approximate conference seed (see playoffs.estimate_conference_seed)
@@ -539,6 +599,7 @@ def aggregate_span(
             result["regular"]["relative_shooting"] = _relative_shooting(
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
+            result["regular"]["league"] = _league_averages(store, reg_games, "regular")
             result["regular"]["win_shares"] = compute_win_shares(
                 reg_games, store, "regular", full_team_seasons=not narrowed("regular")
             )
@@ -550,6 +611,7 @@ def aggregate_span(
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
+            result["playoffs"]["league"] = _league_averages(store, po_games, "playoffs")
             result["playoffs"]["win_shares"] = compute_win_shares(
                 po_games, store, "playoffs", full_team_seasons=not narrowed("playoffs")
             )
@@ -598,6 +660,7 @@ def aggregate_duo_span(
             result["regular"]["relative_shooting"] = _relative_shooting(
                 store, reg_games, result["regular"]["shooting"], "regular"
             )
+            result["regular"]["league"] = _league_averages(store, reg_games, "regular")
             # A duo's team context is the games they shared, never the full season.
             result["regular"]["win_shares"] = compute_win_shares(reg_games, store, "regular")
     if duo.include_playoffs:
@@ -608,6 +671,7 @@ def aggregate_duo_span(
             result["playoffs"]["relative_shooting"] = _relative_shooting(
                 store, po_games, result["playoffs"]["shooting"], "playoffs"
             )
+            result["playoffs"]["league"] = _league_averages(store, po_games, "playoffs")
             result["playoffs"]["win_shares"] = compute_win_shares(po_games, store, "playoffs")
             records = _playoffs.compute_series_records(store, po_games, wl_from_player_games=True)
             if narrowed("playoffs"):
